@@ -32,9 +32,13 @@ set(EXT_TARGETS) # list of external targets to link to
 
 # Set Default Executable Name
 set(EXEC_NAME summa.exe)
-# Set top-level directory
-if (USE_NEXTGEN)
-    set(F_MASTER "${CMAKE_CURRENT_SOURCE_DIR}/summa")
+# Configure NextGen source roots
+    set(SUMMA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/summa" CACHE PATH
+        "Path to the SUMMA source tree for NextGen builds")
+    set(ISO_C_FORTRAN_BMI_ROOT
+        "${CMAKE_CURRENT_SOURCE_DIR}/../iso_c_fortran_bmi" CACHE PATH
+        "Path to the iso_c_fortran_bmi source tree for NextGen builds")
+    set(F_MASTER "${SUMMA_ROOT}")
 else()
     set(F_MASTER "${CMAKE_CURRENT_SOURCE_DIR}/..")
 endif()
@@ -56,9 +60,9 @@ if (USE_NEXTGEN)
     message("ENABLING NEXTGEN")
     add_compile_definitions(NGEN_ACTIVE BMI_ACTIVE NGEN_FORCING_ACTIVE
                             NGEN_OUTPUT_ACTIVE)
-    add_subdirectory(../iso_c_fortran_bmi ${CMAKE_BINARY_DIR}/iso_c_bmi)
-    list(INSERT CMAKE_MODULE_PATH 0 "${CMAKE_CURRENT_LIST_DIR}/summa/build/cmake/")
-    list(INSERT CMAKE_PREFIX_PATH 0 "${CMAKE_CURRENT_LIST_DIR}/summa/build/cmake/")
+    add_subdirectory("${ISO_C_FORTRAN_BMI_ROOT}" "${CMAKE_BINARY_DIR}/iso_c_bmi")
+    list(INSERT CMAKE_MODULE_PATH 0 "${F_MASTER}/build/cmake/")
+    list(INSERT CMAKE_PREFIX_PATH 0 "${F_MASTER}/build/cmake/")
     set(CMAKE_Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/fortran)
     set(SUMMA_LIB_NAME_CMAKE summabmi)
     set(SUMMA_LIB_DESC_CMAKE "Summa-Sundials BMI Module Shared Library")
@@ -243,7 +247,7 @@ if(USE_NEXTGEN)
 	install(TARGETS summabmi
                 LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
                 PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-	configure_file(summabmi.pc.in summabmi.pc @ONLY)
+	configure_file("${F_MASTER}/build/cmake/summabmi.pc.in" summabmi.pc @ONLY)
 	install(FILES ${CMAKE_BINARY_DIR}/summabmi.pc DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/pkgconfig)
 else()
 	add_library(summa SHARED ${SUMMA_ALL})
