@@ -264,6 +264,10 @@ contains
  ! ***** part 2: compute time
  ! **********************************************************************************************
 
+! Native forcing derives time_data from fulltimeVec and forcFileInfo. BMI
+! forcing (NGEN_FORCING_ACTIVE) does not populate fulltimeVec or forcFileInfo
+! and has already built time_data from currentJulDay, so this block is skipped.
+#ifndef NGEN_FORCING_ACTIVE
  ! check that the computed julian day matches the time information in the NetCDF file
  dataJulDay = fulltimeVec(jRead)/forcFileInfo(iFile)%convTime2Days + refJulDay_data
  if(abs(currentJulDay - dataJulDay) > timeDiffTol)then
@@ -281,6 +285,7 @@ contains
                  time_data(iLookTIME%imin),dsec, & ! output = minute/second
                  err,cmessage)                     ! output = error control
  if(err/=0)then; message=trim(message)//trim(cmessage); return; end if
+#endif
 
  ! check to see if any of the time data is missing -- note that it is OK if ih_tz or imin_tz are missing
  if((time_data(iLookTIME%iyyy)==integerMissing) .or. &
