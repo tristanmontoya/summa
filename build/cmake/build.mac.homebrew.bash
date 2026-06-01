@@ -1,6 +1,7 @@
 #!/bin/bash
 
-# build SUMMA on a Mac using Bash, from cmake directory run this as ./build.mac.bash
+# build SUMMA on a Mac using Bash, from cmake directory run this as 
+# ./build.mac.homebrew.bash
 
 # Fortran compiler
 export FC=/opt/homebrew/bin/gfortran
