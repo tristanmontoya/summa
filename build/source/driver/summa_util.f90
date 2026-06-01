@@ -411,7 +411,7 @@ contains
 #endif
  ! stop with message
  if(err==0)then
-! NGen BMI finalization returns to the host instead of ending the process
+! Successful NGen BMI finalization returns to the caller instead of ending the process
 #ifdef NGEN_ACTIVE
   return
 #endif
