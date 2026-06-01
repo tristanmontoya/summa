@@ -33,6 +33,7 @@ set(EXT_TARGETS) # list of external targets to link to
 # Set Default Executable Name
 set(EXEC_NAME summa.exe)
 # Configure NextGen source roots
+if(USE_NEXTGEN)
     set(SUMMA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/summa" CACHE PATH
         "Path to the SUMMA source tree for NextGen builds")
     set(ISO_C_FORTRAN_BMI_ROOT
