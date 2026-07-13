@@ -405,10 +405,10 @@ module summabmi
      call handle_err(err, message)
 
      ! write the model output
-!#ifndef NGEN_OUTPUT_ACTIVE
+#ifndef NGEN_OUTPUT_ACTIVE
      call summa_writeOutputFiles(this%model%timeStep, this%model%summa1_struc(n), err, message)
      call handle_err(err, message)
-!#endif
+#endif
 
      ! update global variables that change during the model simulation
      this%model%timeStep = this%model%timeStep + 1
