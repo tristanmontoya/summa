@@ -144,12 +144,14 @@ subroutine summa_SetTimesDirsAndFiles(summaFileManagerIn,err,message)
   end do
 
   ! before embarking on a run, check that the output directory is writable; write system date and time to a log file there
+#ifndef NGEN_OUTPUT_ACTIVE
   open(runinfo_fileunit,file=trim(OUTPUT_PATH)//"runinfo.txt",iostat=err)
   if(err/=0)then; err=10; message=trim(message)//"cannot write to output directory '"//trim(OUTPUT_PATH)//"'"; return; end if
   call date_and_time(cdate,ctime)
   write(runinfo_fileunit,*) 'Run start time on system:  ccyy='//cdate(1:4)//' - mm='//cdate(5:6)//' - dd='//cdate(7:8), &
                           ' - hh='//ctime(1:2)//' - mi='//ctime(3:4)//' - ss='//ctime(5:10)
   close(runinfo_fileunit)
+#endif
 
 end subroutine summa_SetTimesDirsAndFiles
 
