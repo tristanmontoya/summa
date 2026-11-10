@@ -13,9 +13,11 @@ set(NOAHMP
 
 set(NRTYPE
     ${NUMREC_DIR}/nr_type.f90
+    ${PARALLEL_DIR}/parallel_context.f90
     CACHE INTERNAL "NRTYPE")
 
 set(SUMMA_DATA_TYPES
+    ${CALIBR_DIR}/calibration_types.f90
     ${DSHARE_DIR}/var_lookup.f90
     ${DSHARE_DIR}/data_types.f90
     CACHE INTERNAL "SUMMA_DATA_TYPES")
@@ -61,6 +63,7 @@ set(DATAMS_SUNDIALS
 set(UTILMS
     ${ENGINE_DIR}/matrixOper.f90
     ${ENGINE_DIR}/mDecisions.f90
+    ${ENGINE_DIR}/scratch.f90
     ${ENGINE_DIR}/snow_utils.f90
     ${ENGINE_DIR}/soil_utils.f90
     ${ENGINE_DIR}/time_utils.f90
@@ -87,12 +90,13 @@ set(PRELIM
     ${ENGINE_DIR}/childStruc.f90
     ${ENGINE_DIR}/convert_funcs.f90
     ${ENGINE_DIR}/ffile_info.f90
-    ${ENGINE_DIR}/read_pinit.f90
+    ${ENGINE_DIR}/read_parameter_defaults.f90
     ${ENGINE_DIR}/read_attrb.f90
     ${ENGINE_DIR}/paramCheck.f90
-    ${ENGINE_DIR}/pOverwrite.f90
+    ${ENGINE_DIR}/set_parameter_table_defaults.f90
     ${ENGINE_DIR}/sunGeomtry.f90
-    ${ENGINE_DIR}/param_override.f90
+    ${ENGINE_DIR}/read_trial_parameters.f90
+    ${ENGINE_DIR}/apply_parameter_overrides.f90
     CACHE INTERNAL "PRELIM")
 
 # Model run support modules
@@ -130,6 +134,7 @@ set(SOLVER
     ${ENGINE_DIR}/eval8summa.f90
     ${ENGINE_DIR}/groundwatr.f90
     ${ENGINE_DIR}/glacAreaChange.f90
+    ${ENGINE_DIR}/noahmpContext.f90
     ${ENGINE_DIR}/opSplittin.f90
     ${ENGINE_DIR}/run_oneGRU.f90
     ${ENGINE_DIR}/run_oneHRU.f90
@@ -155,23 +160,13 @@ set(SOLVER_SUNDIALS
 
 # Objective function
 set(OBJFNC
-    ${OBJFNC_DIR}/read_flowobs.f90
+    ${OBJFNC_DIR}/read_observations.f90  
     ${OBJFNC_DIR}/time_align.f90
     ${OBJFNC_DIR}/metrics.f90
+    ${OBJFNC_DIR}/series_transform.f90
+    ${OBJFNC_DIR}/simulated_series.f90
     ${OBJFNC_DIR}/write_evaluation.f90
     CACHE INTERNAL "OBJFNC")
-
-# Model calibration
-set(CALIBR
-    ${CALIBR_DIR}/parameter_search.f90
-    ${CALIBR_DIR}/summa_parameter_spec.f90
-    ${CALIBR_DIR}/calibration_output.f90
-    CACHE INTERNAL "CALIBR")
-
-# MPI-dependent calibration
-set(CALIBR_MPI
-    ${CALIBR_DIR}/summa_parameter_sampling.f90
-    CACHE INTERNAL "CALIBR_MPI")
 
 # Driver support modules
 set(DRIVER
@@ -184,16 +179,18 @@ set(DRIVER
     ${DRIVER_DIR}/summa_work_balance.f90
     ${DRIVER_DIR}/summa_init.f90
     ${DRIVER_DIR}/summa_forcing.f90
+    ${DRIVER_DIR}/summa_lakeCoupling.f90
     ${DRIVER_DIR}/summa_modelRun.f90
     ${DRIVER_DIR}/summa_writeOutput.f90
     ${DRIVER_DIR}/summa_simulation.f90
     ${DRIVER_DIR}/summa_spinup.f90
     CACHE INTERNAL "DRIVER")
+set(DRIVER_OPT
+    ${DRIVER_DIR}/summa_calibration_case.f90
+    CACHE INTERNAL "DRIVER_OPT")
 set(DRIVER_TOML
     ${DRIVER_DIR}/summa_config.f90
     CACHE INTERNAL "DRIVER_TOML")
 set(DRIVER_BMI
     ${DRIVER_DIR}/summa_bmi.f90
     CACHE INTERNAL "DRIVER_BMI")
-# TOML configuration reader: only built with mizuRoute, which is its only consumer
-

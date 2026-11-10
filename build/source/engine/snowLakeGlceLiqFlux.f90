@@ -79,14 +79,13 @@ subroutine snowLakeGlceLiqFlux(&
   type(var_dlength),intent(in)      :: prog_data                  ! prognostic variables for a local HRU
   type(var_dlength),intent(inout)   :: diag_data                  ! diagnostic variables for a local HRU
   ! input-output: fluxes and derivatives
-  type(io_type_snowLakeGlceLiqFlux)          :: io_snowLakeGlceLiqFlux              ! fluxes and derivatives
+  type(io_type_snowLakeGlceLiqFlux),target   :: io_snowLakeGlceLiqFlux              ! fluxes and derivatives
   ! output: error control
   type(out_type_snowLakeGlceLiqFlux)         :: out_snowLakeGlceLiqFlux             ! error control
   ! ------------------------------------------------------------------------------------------------------------------------------------------
   ! local variables
   integer(i4b)                      :: nLayers,nStart             ! number of snow/glce layers with water movement and starting layer
   integer(i4b)                      :: iLayer                     ! layer index
-  integer(i4b)                      :: ixLayerDesired(1)          ! layer desired (scalar solution)
   integer(i4b)                      :: ixTop                      ! top layer in subroutine call
   integer(i4b)                      :: ixBot                      ! bottom layer in subroutine call
   real(rkind)                       :: multResid                  ! multiplier for the residual water content (-)
@@ -95,8 +94,8 @@ subroutine snowLakeGlceLiqFlux(&
    real(rkind)                      :: maxVolIceContent_use       ! maximum volumetric ice content depending if snow or firn
   real(rkind)                       :: availCap                   ! available storage capacity [0,1] (-)
   real(rkind)                       :: relSaturn                  ! relative saturation [0,1] (-)
-  real(rkind)                       :: iLayerLiqFluxSnLaGl(0:in_snowLakeGlceLiqFlux % nLayers)
-  real(rkind)                       :: iLayerLiqFluxSnLaGlDeriv(0:in_snowLakeGlceLiqFlux % nLayers)  
+  real(rkind),pointer               :: iLayerLiqFluxSnLaGl(:)       ! interface fluxes of these layers, indexed from 0 (m s-1)
+  real(rkind),pointer               :: iLayerLiqFluxSnLaGlDeriv(:)  ! their derivatives, indexed from 0 (m s-1)
   ! ------------------------------------------------------------------------------------------------------------------------------------------
   ! make association of local variables with information in the data structures
   nLayers = in_snowLakeGlceLiqFlux % nLayers ! get number of snow/glce layers to get water fluxes over
@@ -115,7 +114,6 @@ subroutine snowLakeGlceLiqFlux(&
     whole_step              => in_snowLakeGlceLiqFlux % whole_step,              & ! intent(in): length of the whole step glacier excess water drains over (s)
     mLayerVolFracLiqTrial   => in_snowLakeGlceLiqFlux % mLayerVolFracLiqTrial,   & ! intent(in): trial value of volumetric fraction of liquid water at the current iteration (-)
     ! input: layer indices
-    ixLayerState     => indx_data%var(iLookINDEX%ixLayerState)%dat,              & ! intent(in):    list of indices for all model layers
     ixSnowOnlyHyd    => indx_data%var(iLookINDEX%ixSnowOnlyHyd)%dat,             & ! intent(in):    index in the state subset for hydrology state variables in the snow domain
     ixGlceOnlyHyd    => indx_data%var(iLookINDEX%ixGlceOnlyHyd)%dat,             & ! intent(in):    index in the state subset for hydrology state variables in the glacier ice domain
     ! input: snow properties and parameters
@@ -128,9 +126,6 @@ subroutine snowLakeGlceLiqFlux(&
     ! input-output: diagnostic variables -- only computed for the first iteration
     mLayerPoreSpace  => diag_data%var(iLookDIAG%mLayerPoreSpace)%dat(nStart+1:nStart+nLayers),  & ! intent(inout): pore space in each layer (-)
     mLayerThetaResid => diag_data%var(iLookDIAG%mLayerThetaResid)%dat(nStart+1:nStart+nLayers), & ! intent(inout): residual volumetric liquid water content in each layer (-)
-    ! input-output: fluxes and derivatives
-    iLayerLiqFluxSnLaGl0      => io_snowLakeGlceLiqFlux % iLayerLiqFluxSnLaGl,           & ! intent(inout): vertical liquid water flux at layer interfaces (m s-1)
-    iLayerLiqFluxSnLaGlDeriv0 => io_snowLakeGlceLiqFlux % iLayerLiqFluxSnLaGlDeriv,      & ! intent(inout): derivative in vertical liquid water flux at layer interfaces (m s-1)
     ! output: error control
     err                    => out_snowLakeGlceLiqFlux % err,                             & ! intent(out):   error code
     message                => out_snowLakeGlceLiqFlux % cmessage                         & ! intent(out):   error message
@@ -139,9 +134,9 @@ subroutine snowLakeGlceLiqFlux(&
     ! initialize error control
     err=0; message='snowLakeGlceLiqFlux/'
 
-    ! initialize with index 0
-    iLayerLiqFluxSnLaGl = iLayerLiqFluxSnLaGl0(nStart:nLayers+nStart)
-    iLayerLiqFluxSnLaGlDeriv = iLayerLiqFluxSnLaGlDeriv0(nStart:nLayers+nStart)
+    ! interface fluxes and derivatives of these layers, viewed in place with index 0
+    iLayerLiqFluxSnLaGl(0:nLayers)      => io_snowLakeGlceLiqFlux % iLayerLiqFluxSnLaGl(nStart:nLayers+nStart)
+    iLayerLiqFluxSnLaGlDeriv(0:nLayers) => io_snowLakeGlceLiqFlux % iLayerLiqFluxSnLaGlDeriv(nStart:nLayers+nStart)
 
     ! check that the input vectors match nLayers
     if (size(mLayerVolFracLiqTrial)/=nLayers .or. size(mLayerVolFracIce)/=nLayers .or. &
@@ -164,13 +159,12 @@ subroutine snowLakeGlceLiqFlux(&
     ! get the indices for the layers
     ixTop = integerMissing
     if (scalarSolution) then
-      if (do_snow)then
-        ixLayerDesired = pack(ixLayerState, ixSnowOnlyHyd/=integerMissing)
+      if (do_snow)then ! first layer of the domain with a hydrology state in the subset
+        ixTop = findloc(ixSnowOnlyHyd/=integerMissing, .true., 1)
       else
-        ixLayerDesired = pack(ixLayerState, ixGlceOnlyHyd/=integerMissing)
+        ixTop = findloc(ixGlceOnlyHyd/=integerMissing, .true., 1)
       end if
-      ixTop = ixLayerDesired(1)
-      ixBot = ixLayerDesired(1)
+      ixBot = ixTop
     else
       ixTop = 1
       ixBot = nLayers
@@ -232,10 +226,6 @@ subroutine snowLakeGlceLiqFlux(&
       iLayerLiqFluxSnLaGl(nLayers) = iLayerLiqFluxSnLaGl(nLayers) + bottom_flux   ! set the bottom flux if already computed
       iLayerLiqFluxSnLaGlDeriv(nLayers) = iLayerLiqFluxSnLaGlDeriv(nLayers) ! may be modified computed inside computJacob, currently bottom flux is always 0 so not needed
     end if
-
-    ! save the results with index 0
-    iLayerLiqFluxSnLaGl0(nStart:nLayers+nStart) = iLayerLiqFluxSnLaGl
-    iLayerLiqFluxSnLaGlDeriv0(nStart:nLayers+nStart) = iLayerLiqFluxSnLaGlDeriv
 
   end associate ! end association of local variables with information in the data structures
 

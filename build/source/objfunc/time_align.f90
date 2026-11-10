@@ -8,47 +8,52 @@ module timeseries_alignment
   private
 
   public :: align_timeseries
+  public :: select_aligned_window
 
 contains
 
+
   ! **************************************************************************************************
-  ! Align simulated and observed streamflow time series.
+  ! Align simulated and observed time series.
   !
-  ! The routine:
-  !   - converts simulation and observation times to a common absolute time axis
-  !   - assumes observation timestamps represent the end of each averaging period
-  !   - averages higher-frequency simulated flow over each observation period
-  !   - removes periods with missing observed or simulated values
-  !
-  ! Observation time steps are currently assumed to be regular.
+  !  The routine:
+  !    - converts simulation and observation times to a common absolute time axis
+  !    - averages simulated values over each observation period
+  !    - preserves the original observation time bounds
+  !    - returns the number of contributing simulation steps
+  !    - retains missing values for subsequent objective-function masking
   ! **************************************************************************************************
-  subroutine align_timeseries(timeSim,flowSim,timeSimUnits,flowSimUnits, &
-                              timeObs,flowObs,timeObsUnits,flowObsUnits, &
-                              startDate,endDate,                         &
-                              timeAligned,flowSimAligned,flowObsAligned, &
-                              err,message)
+  subroutine align_timeseries(timeSim,valSim,timeSimUnits,valSimUnits,   &
+                              timeObs,valObs,timeObsUnits,valObsUnits,   &
+                              startDate,endDate,timeBounds,              &
+                              timeAligned,timeBoundsAligned,nSimAligned, &
+                              valSimAligned,valObsAligned,err,message)
     ! dummy arguments
-    real(rkind), intent(in)                   :: timeSim(:)          ! simulation time
-    real(rkind), intent(in)                   :: flowSim(:)          ! simulated streamflow
-    character(*), intent(in)                  :: timeSimUnits        ! simulation time units
-    character(*), intent(in)                  :: flowSimUnits        ! simulation flow units
-    real(rkind), intent(in)                   :: timeObs(:)          ! observation time
-    real(rkind), intent(in)                   :: flowObs(:)          ! observed streamflow
-    character(*), intent(in)                  :: timeObsUnits        ! observation time units
-    character(*), intent(in)                  :: flowObsUnits        ! observation flow units
-    character(*), intent(in)                  :: startDate           ! start date (YYYY-MM-DD)
-    character(*), intent(in)                  :: endDate             ! end date (YYYY-MM-DD)
-    real(rkind), allocatable, intent(out)     :: timeAligned(:)      ! aligned observation time
-    real(rkind), allocatable, intent(out)     :: flowSimAligned(:)   ! aligned simulated streamflow
-    real(rkind), allocatable, intent(out)     :: flowObsAligned(:)   ! aligned observed streamflow
-    integer(i4b), intent(out)                 :: err                 ! error code
-    character(*), intent(out)                 :: message             ! error message
+    real(rkind)   , intent(in)                  :: timeSim(:)          ! simulation time
+    real(rkind)   , intent(in)                  :: valSim(:)           ! simulated values
+    character(*)  , intent(in)                  :: timeSimUnits        ! simulation time units
+    character(*)  , intent(in)                  :: valSimUnits         ! simulation units
+    real(rkind)   , intent(in)                  :: timeObs(:)          ! observation time
+    real(rkind)   , intent(in)                  :: valObs(:)           ! observation
+    character(*)  , intent(in)                  :: timeObsUnits        ! observation time units
+    character(*)  , intent(in)                  :: valObsUnits         ! observation units
+    character(*)  , intent(in)                  :: startDate           ! start date (YYYY-MM-DD)
+    character(*)  , intent(in)                  :: endDate             ! end date (YYYY-MM-DD)
+    real(rkind)   , intent(in)                  :: timeBounds(:,:)     ! observation time bounds (2,nObs)
+    real(rkind)   , intent(out) , allocatable   :: timeAligned(:)      ! aligned observation time
+    real(rkind)   , intent(out) , allocatable   :: timeBoundsAligned(:,:) ! original observation interval boundaries 
+    integer(i4b)  , intent(out) , allocatable   :: nSimAligned(:)         ! number of model time steps selected in each interval 
+    real(rkind)   , intent(out) , allocatable   :: valSimAligned(:)    ! aligned simulation
+    real(rkind)   , intent(out) , allocatable   :: valObsAligned(:)    ! aligned observation
+    integer(i4b)  , intent(out)                 :: err                 ! error code
+    character(*)  , intent(out)                 :: message             ! error message
     ! locals
     real(rkind), allocatable :: timeSimSec(:)   ! simulation time on common time axis
     real(rkind), allocatable :: timeObsSec(:)   ! observation time on common time axis
-    real(rkind), allocatable :: simMean(:)      ! simulated flow averaged to observation periods
+    real(rkind), allocatable :: timeBegSec(:)   ! observation time bounds on common time axis
+    real(rkind), allocatable :: timeEndSec(:)   ! observation time bounds on common time axis
+    real(rkind), allocatable :: simMean(:)      ! simulations averaged to observation periods
     integer(i4b), allocatable :: nSim(:)        ! number of simulation values in each period
-    real(rkind) :: obsStep                      ! observation time step in seconds
     real(rkind) :: tStart                       ! start of observation period
     real(rkind) :: tEnd                         ! end of observation period
     real(rkind) :: tol                          ! time comparison tolerance
@@ -68,16 +73,20 @@ contains
     nanValue = ieee_value(0._rkind, ieee_quiet_nan)
 
     ! check array dimensions
-    if(size(timeSim)/=size(flowSim))then
-      message=trim(message)//'simulation time and flow dimensions differ'
+    if(size(timeSim)/=size(valSim))then
+      message=trim(message)//'simulation time and val dimensions differ'
       err=20; return
     endif
-    if(size(timeObs)/=size(flowObs))then
-      message=trim(message)//'observation time and flow dimensions differ'
+    if(size(timeObs)/=size(valObs))then
+      message=trim(message)//'observation time and val dimensions differ'
       err=20; return
     endif
     if(size(timeObs)<2)then
       message=trim(message)//'at least two observations are required'
+      err=20; return
+    endif
+    if(size(timeBounds,1)/=2 .or. size(timeBounds,2)/=size(timeObs))then
+      message=trim(message)//'observation time bounds must be (2, number of observations)'
       err=20; return
     endif
 
@@ -93,10 +102,10 @@ contains
       err=20; return
     endif
 
-    ! check flow units
-    if(.not.flow_units_equivalent(flowSimUnits,flowObsUnits))then
-      message=trim(message)//'simulation and observation flow units differ: "'// &
-              trim(flowSimUnits)//'" and "'//trim(flowObsUnits)//'"'
+    ! Check consistency of simulated and observed units
+    if(.not.val_units_equivalent(valSimUnits,valObsUnits))then
+      message=trim(message)//'simulation and observation units differ: "'// &
+              trim(valSimUnits)//'" and "'//trim(valObsUnits)//'"'
       err=20; return
     endif
 
@@ -105,6 +114,10 @@ contains
     if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
     call convert_time_to_seconds(timeObs,timeObsUnits,timeObsSec,err,cmessage)
     if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+    call convert_time_to_seconds(timeBounds(1,:),timeObsUnits,timeBegSec,err,cmessage)
+    if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+    call convert_time_to_seconds(timeBounds(2,:),timeObsUnits,timeEndSec,err,cmessage)
+    if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
 
     ! convert evaluation dates to the same absolute time axis
     call reference_time_seconds(trim(startDate),evalStart,err,cmessage)
@@ -112,20 +125,14 @@ contains
     call reference_time_seconds(trim(endDate),evalEnd,err,cmessage)
     if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
 
-    ! determine observation time step
-    obsStep = timeObsSec(2)-timeObsSec(1)
-    if(obsStep<=0._rkind)then
-      message=trim(message)//'observation times are not increasing'
-      err=20; return
-    endif
-
     ! allow small floating-point differences in time coordinates
-    tol = max(1.e-6_rkind,1.e-8_rkind*obsStep)
+    tol = max(1.e-6_rkind, &
+              1.e-8_rkind*abs(timeEndSec(1)-timeBegSec(1)))
 
-    ! check that observation time step is regular
-    do iObs=2,size(timeObsSec)-1
-      if(abs((timeObsSec(iObs+1)-timeObsSec(iObs))-obsStep)>tol)then
-        message=trim(message)//'observation time step is not regular'
+    ! observation times may be irregular (a monthly product's months are 28 to 31 days long), but must increase
+    do iObs=2,size(timeObsSec)
+      if(timeObsSec(iObs)-timeObsSec(iObs-1) <= 0._rkind)then
+        message=trim(message)//'observation times are not increasing'
         err=20; return
       endif
     enddo
@@ -136,25 +143,24 @@ contains
     simMean = 0._rkind
     nSim    = 0
 
-    ! aggregate simulated flow to observation periods
-    ! timestamps are assumed to represent period ending, so observation i
-    ! represents the interval: timeObs(i)-obsStep < t <= timeObs(i)
+    ! aggregate simulated val to observation periods
     do iObs=1,size(timeObsSec)
 
       ! only process observations within the evaluation period
       if(timeObsSec(iObs) >= evalStart .and. timeObsSec(iObs) <  evalEnd)then
      
-        ! observation timestamps are assumed to be period ending
-        tStart = timeObsSec(iObs)-obsStep
-        tEnd   = timeObsSec(iObs)
+        ! use actual observation time bounds
+        tStart = timeBegSec(iObs)
+        tEnd   = timeEndSec(iObs)
+
         do iSim=1,size(timeSimSec)
           if(timeSimSec(iSim)>tStart+tol .and. timeSimSec(iSim)<=tEnd+tol)then
-            simMean(iObs) = simMean(iObs)+flowSim(iSim)
+            simMean(iObs) = simMean(iObs)+valSim(iSim)
             nSim(iObs)    = nSim(iObs)+1
           endif
         enddo
      
-        ! compute mean simulated flow over the observation period
+        ! compute mean simulated val over the observation period
         if(nSim(iObs)>0)then
           simMean(iObs) = simMean(iObs)/real(nSim(iObs),rkind)
         else
@@ -175,25 +181,134 @@ contains
       err=20; return
     endif
 
-    ! allocate aligned arrays
+    ! Allocate aligned arrays
     allocate(timeAligned(nMatch))
-    allocate(flowSimAligned(nMatch))
-    allocate(flowObsAligned(nMatch))
-    
-    ! populate aligned arrays
-    nMatch = 0
-    do iObs=1,size(timeObs)
-      if(timeObsSec(iObs) >= evalStart .and. timeObsSec(iObs) <  evalEnd)then
-        nMatch=nMatch+1
-    
-        ! retain the original observation time coordinate
-        timeAligned(nMatch)    = timeObs(iObs)
-        flowSimAligned(nMatch) = simMean(iObs)
-        flowObsAligned(nMatch) = flowObs(iObs)
-      endif
-    enddo
+    allocate(timeBoundsAligned(2,nMatch))
+    allocate(nSimAligned(nMatch))
+    allocate(valSimAligned(nMatch))
+    allocate(valObsAligned(nMatch))
+
+   ! Populate aligned arrays
+   nMatch = 0
+   
+   do iObs=1,size(timeObs)
+   
+     if(timeObsSec(iObs)>=evalStart .and. &
+        timeObsSec(iObs)<evalEnd)then
+   
+       nMatch = nMatch+1
+   
+       ! Preserve original observation coordinates and intervals
+       timeAligned(nMatch)         = timeObs(iObs)
+       timeBoundsAligned(:,nMatch) = timeBounds(:,iObs)
+   
+       ! Number of simulated values used in this interval
+       nSimAligned(nMatch) = nSim(iObs)
+   
+       ! Aligned observed and simulated values
+       valSimAligned(nMatch) = simMean(iObs)
+       valObsAligned(nMatch) = valObs(iObs)
+   
+     endif
+   
+   enddo
 
   end subroutine align_timeseries
+
+  ! **************************************************************************************************
+  ! Retain only aligned observations within [startDate,endDate).
+  ! Allows alignment over the union of baseline and evaluation periods, while ensuring
+  ! the objective and diagnostic NetCDF still contain only evaluation observations.
+  ! **************************************************************************************************
+  subroutine select_aligned_window(time,bounds,nSteps,valSim,valObs,timeUnits,startDate,endDate, &
+                                   err,message)
+    real(rkind), allocatable, intent(inout) :: time(:),bounds(:,:),valSim(:),valObs(:)
+    integer(i4b), allocatable, intent(inout) :: nSteps(:)
+    character(*), intent(in) :: timeUnits,startDate,endDate
+    integer(i4b), intent(out) :: err
+    character(*), intent(out) :: message
+
+    real(rkind), allocatable :: timeSec(:)
+    real(rkind), allocatable :: timeKeep(:),boundsKeep(:,:),simKeep(:),obsKeep(:)
+    integer(i4b), allocatable :: stepsKeep(:)
+    real(rkind) :: evalStart,evalEnd
+    integer(i4b) :: i,j,nKeep
+    character(len=256) :: cmessage
+
+    err=0
+    message='select_aligned_window/'
+
+    ! Check dimensions
+    if(size(bounds,1)/=2 .or. size(bounds,2)/=size(time) .or. &
+       size(nSteps)/=size(time) .or. size(valSim)/=size(time) .or. &
+       size(valObs)/=size(time))then
+      message=trim(message)//'aligned series lengths differ'
+      err=20; return
+    endif
+
+    ! Convert observation times to the common absolute time axis
+    call convert_time_to_seconds(time,timeUnits,timeSec,err,cmessage)
+    if(err/=0)then
+      message=trim(message)//trim(cmessage)
+      return
+    endif
+
+    ! Convert evaluation start date
+    call reference_time_seconds(trim(startDate),evalStart,err,cmessage)
+    if(err/=0)then
+      message=trim(message)//trim(cmessage)
+      return
+    endif
+
+    ! Convert evaluation end date
+    call reference_time_seconds(trim(endDate),evalEnd,err,cmessage)
+    if(err/=0)then
+      message=trim(message)//trim(cmessage)
+      return
+    endif
+
+    if(evalEnd<=evalStart)then
+      message=trim(message)//'evaluation end must be later than start'
+      err=20; return
+    endif
+
+    ! Count observations inside the evaluation period
+    nKeep=count(timeSec>=evalStart .and. timeSec<evalEnd)
+
+    if(nKeep==0)then
+      message=trim(message)//'no observations within evaluation period'
+      err=20; return
+    endif
+
+    ! Allocate evaluation-only arrays
+    allocate(timeKeep(nKeep),boundsKeep(2,nKeep),stepsKeep(nKeep), &
+             simKeep(nKeep),obsKeep(nKeep))
+
+    ! Copy evaluation observations
+    j=0
+    do i=1,size(time)
+
+      if(timeSec(i)<evalStart .or. timeSec(i)>=evalEnd) cycle
+
+      j=j+1
+
+      timeKeep(j)=time(i)
+      boundsKeep(:,j)=bounds(:,i)
+      stepsKeep(j)=nSteps(i)
+      simKeep(j)=valSim(i)
+      obsKeep(j)=valObs(i)
+
+    enddo
+
+    ! Replace the original arrays
+    call move_alloc(timeKeep,time)
+    call move_alloc(boundsKeep,bounds)
+    call move_alloc(stepsKeep,nSteps)
+    call move_alloc(simKeep,valSim)
+    call move_alloc(obsKeep,valObs)
+
+  end subroutine select_aligned_window
+
 
   ! **************************************************************************************************
   ! Convert a CF-style time coordinate to seconds on a common absolute time axis.
@@ -349,22 +464,22 @@ contains
   ! **************************************************************************************************
   ! Check whether streamflow unit strings describe cubic metres per second.
   ! **************************************************************************************************
-  logical function flow_units_equivalent(units1,units2)
+  logical function val_units_equivalent(units1,units2)
     character(*), intent(in) :: units1
     character(*), intent(in) :: units2
     character(len=128) :: u1
     character(len=128) :: u2
 
-    u1 = canonical_flow_units(units1)
-    u2 = canonical_flow_units(units2)
-    flow_units_equivalent = trim(u1)==trim(u2)
+    u1 = canonical_value_units(units1)
+    u2 = canonical_value_units(units2)
+    val_units_equivalent = trim(u1)==trim(u2)
 
-  end function flow_units_equivalent
+  end function val_units_equivalent
 
   ! **************************************************************************************************
   ! Convert common streamflow-unit spellings to a canonical representation.
   ! **************************************************************************************************
-  function canonical_flow_units(units) result(canonical)
+  function canonical_value_units(units) result(canonical)
     character(*), intent(in) :: units
     character(len=128) :: canonical
     character(len=128) :: work
@@ -377,7 +492,7 @@ contains
       case default; canonical = trim(work)
     end select
 
-  end function canonical_flow_units
+  end function canonical_value_units
 
   ! **************************************************************************************************
   ! Convert a character string to lower case.

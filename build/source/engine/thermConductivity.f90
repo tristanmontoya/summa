@@ -3,6 +3,7 @@ module thermConductivity_module
 
 ! data types
 USE nr_type
+USE scratch_module,only:sizeScratch  ! size the per-thread scratch arrays
 
 ! derived types to define the data structures
 USE data_types,only:&
@@ -331,7 +332,6 @@ subroutine thermConductivity(&
   character(LEN=256)                   :: cmessage                 ! error message of downwind routine
   logical(lgt)                         :: doVegNrgFlux             ! flag to compute the energy flux over vegetation
   integer(i4b)                         :: iLayer                   ! index of model layers
-  integer(i4b)                         :: ixLayerDesired(1)        ! layer desired (scalar solution)
   integer(i4b)                         :: ixTop                    ! top layer in subroutine call
   integer(i4b)                         :: ixBot                    ! bottom layer in subroutine call
   integer(i4b)                         :: iSoil                    ! index of soil layer
@@ -347,8 +347,8 @@ subroutine thermConductivity(&
   real(rkind)                          :: kerstenNum               ! the Kersten number (-), defining weight applied to conductivity of the wet medium
   real(rkind)                          :: den                      ! denominator in the thermal conductivity calculations
   real(rkind)                          :: Tcrit                    ! temperature where all water is unfrozen (K)
-  real(rkind),dimension(nLayers)       :: dThermalC_dWat           ! derivative in thermal conductivity w.r.t. matric head or volumetric liquid water
-  real(rkind),dimension(nLayers)       :: dThermalC_dNrg           ! derivative in thermal conductivity w.r.t. temperature
+  real(rkind),allocatable,save         :: dThermalC_dWat(:)        ! derivative in thermal conductivity w.r.t. matric head or volumetric liquid water
+  real(rkind),allocatable,save         :: dThermalC_dNrg(:)        ! derivative in thermal conductivity w.r.t. temperature
   real(rkind)                          :: dlambda_wet_dWat         ! derivative in thermal conductivity of wet material w.r.t.soil water state variable
   real(rkind)                          :: dlambda_wet_dTk          ! derivative in thermal conductivity of wet material w.r.t. temperature
   real(rkind)                          :: dkerstenNum_dWat         ! derivative in Kersten number w.r.t. soil water state variable
@@ -366,6 +366,10 @@ subroutine thermConductivity(&
   real(rkind),parameter                :: f2=1.06_rkind            ! optimized parameter from Hansson et al. VZJ 2005 (-)
   real(rkind)                          :: fArg,xArg                ! temporary variables (see Hansson et al. VZJ 2005 for details)
   real(rkind)                          :: dxArg_dWat,dxArg_dTk     ! derivates of the temporary variables with respect to soil water state variable and temperature
+  ! one copy of the scratch arrays per thread
+  !$omp threadprivate(dThermalC_dWat, dThermalC_dNrg)
+
+  call sizeScratch(1,nLayers,dThermalC_dWat, dThermalC_dNrg)
 
   ! --------------------------------------------------------------------------------------------------------------------------------
   ! associate variables in data structure
@@ -411,9 +415,8 @@ subroutine thermConductivity(&
     doVegNrgFlux = (ixCasNrg/=integerMissing .or. ixVegNrg/=integerMissing .or. ixTopNrg/=integerMissing)
     if (nSnLaSoGlNrg>0) then
       if (scalarSolution) then
-        ixLayerDesired = pack(ixLayerState, ixSnLaSoGlNrg/=integerMissing)
-        ixTop = ixLayerDesired(1)
-        ixBot = ixLayerDesired(1)
+        ixTop = ixLayerState(findloc(ixSnLaSoGlNrg/=integerMissing, .true., 1)) ! first layer with an energy state in the subset
+        ixBot = ixTop
       else
         ixTop = 1
         ixBot = nLayers

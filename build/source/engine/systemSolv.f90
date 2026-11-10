@@ -22,9 +22,11 @@ module systemSolv_module
 
 ! data types
 USE nr_type
+USE scratch_module,only:sizeScratch  ! size the per-thread scratch arrays
 
 ! access missing values
 USE globalData,only:integerMissing  ! missing integer
+USE globalData,only:soilLateralFlow ! flag: soil layers drain laterally
 USE globalData,only:realMissing     ! missing real number
 USE globalData,only:quadMissing     ! missing quadruple precision number
 
@@ -53,6 +55,7 @@ USE globalData,only:flux_meta       ! metadata on the model fluxes
 
 ! constants
 USE multiconst,only:&
+                    Tfreeze,      & ! freezing point of pure water         (K)
                     iden_ice,     & ! intrinsic density of ice             (kg m-3)
                     iden_water      ! intrinsic density of liquid water    (kg m-3)
 
@@ -150,7 +153,7 @@ subroutine systemSolv(&
                       err,message)         ! intent(out):   error code and error message
   ! ---------------------------------------------------------------------------------------
   ! structure allocations
-  USE allocspace_module,only:allocLocal                     ! allocate local data structures
+  USE allocspace_module,only:allocCached,ixCache_systemSolvInit,ixCache_systemSolvSum ! cached local data structures
   ! state vector and solver
   USE getVectorz_module,only:getScaling                     ! get the scaling vectors and state multipliers
   USE convertEnthalpyTemp_module,only:T2enthalpy_snLaGlWat  ! convert temperature to liq+ice enthalpy for a snow/lake/glce layer
@@ -228,33 +231,33 @@ subroutine systemSolv(&
   ! ------------------------------------------------------------------------------------------------------
   logical(lgt),parameter          :: forceFullMatrix=.false.       ! flag to force the use of the full Jacobian matrix
   integer(i4b)                    :: ixMatrix                      ! form of matrix (band diagonal or full matrix)
-  type(var_dlength)               :: flux_init                     ! model fluxes at the start of the time step
+  type(var_dlength),pointer       :: flux_init                     ! model fluxes at the start of the time step
   real(rkind),allocatable         :: dBaseflow_dWat(:,:)           ! derivative in baseflow w.r.t. soil water characteristic
   real(rkind),allocatable         :: dBaseflow_dTk(:,:)            ! derivative in baseflow w.r.t. temperature (m s-1 K-1)
-  real(rkind)                     :: stateVecNew(nState)           ! new state vector (mixed units)
-  real(rkind)                     :: fluxVec0(nState)              ! flux vector (mixed units)
-  real(rkind)                     :: dMat(nState)                  ! diagonal matrix (excludes flux derivatives)
-  real(qp)                        :: sMul(nState)    ! NOTE: qp    ! multiplier for state vector for the residual calculations
-  real(rkind)                     :: rAdd(nState)                  ! additional terms in the residual vector
+  real(rkind),allocatable,save    :: stateVecNew(:)                ! new state vector (mixed units)
+  real(rkind),allocatable,save    :: fluxVec0(:)                   ! flux vector (mixed units)
+  real(rkind),allocatable,save    :: dMat(:)                       ! diagonal matrix (excludes flux derivatives)
+  real(qp),allocatable,save       :: sMul(:)         ! NOTE: qp    ! multiplier for state vector for the residual calculations
+  real(rkind),allocatable,save    :: rAdd(:)                       ! additional terms in the residual vector
   logical(lgt)                    :: feasible                      ! feasibility flag
   logical(lgt)                    :: sunSucceeds                   ! flag to indicate if SUNDIALS successfully solved the problem in current data step
   integer(i4b)                    :: top                           ! index of the top layer (1 for snow, 1+nSoil+nLake for glacier ice)
   ! ida variables
-  real(rkind)                     :: atol(nState)                  ! absolute tolerance ida
-  real(rkind)                     :: rtol(nState)                  ! relative tolerance ida
-  type(var_dlength)               :: flux_sum                      ! sum of fluxes model fluxes for a local HRU over a dt_cur
+  real(rkind),allocatable,save    :: atol(:)                       ! absolute tolerance ida
+  real(rkind),allocatable,save    :: rtol(:)                       ! relative tolerance ida
+  type(var_dlength),pointer       :: flux_sum                      ! sum of fluxes model fluxes for a local HRU over a dt_cur
   real(rkind), allocatable        :: mLayerCmpress_sum(:)          ! sum of compression of the soil matrix
   ! ida solver variables outputted if use eval8summaWithPrime (not used here, just inside ida solver)
   logical(lgt)                    :: firstSplitOper0               ! flag to indicate if we are processing the first flux call in a splitting operation, changed inside eval8summaWithPrime
   real(rkind)                     :: scalarCanopyTempPrime         ! prime value for temperature of the vegetation canopy (K s-1)
   real(rkind)                     :: scalarCanopyWatPrime          ! prime value for total water content of the vegetation canopy (kg m-2 s-1)
-  real(rkind)                     :: mLayerTempPrime(nLayers)      ! prime vector of temperature of each layer (K s-1)
+  real(rkind),allocatable,save    :: mLayerTempPrime(:)            ! prime vector of temperature of each layer (K s-1)
   real(rkind), allocatable        :: mLayerMatricHeadPrime(:)      ! prime vector of matric head of each layer (m s-1)
-  real(rkind)                     :: mLayerVolFracWatPrime(nLayers)! prime vector of volumetric total water content of each layer (s-1)
+  real(rkind),allocatable,save    :: mLayerVolFracWatPrime(:)      ! prime vector of volumetric total water content of each layer (s-1)
   ! kinsol and homegrown solver variables
-  real(rkind)                     :: fScale(nState)                ! characteristic scale of the function evaluations (mixed units)
-  real(rkind)                     :: xScale(nState)                ! characteristic scale of the state vector (mixed units)
-  real(qp)                        :: resVecNew(nState)  ! NOTE: qp ! new residual vector homegrown solver
+  real(rkind),allocatable,save    :: fScale(:)                     ! characteristic scale of the function evaluations (mixed units)
+  real(rkind),allocatable,save    :: xScale(:)                     ! characteristic scale of the state vector (mixed units)
+  real(qp),allocatable,save       :: resVecNew(:)       ! NOTE: qp ! new residual vector homegrown solver
   ! homegrown solver variables
   real(rkind)                     :: fOld,fNew                     ! function values (-); NOTE: dimensionless because scaled homegrown solver
   real(rkind)                     :: xMin,xMax                     ! state minimum and maximum (mixed units) homegrown solver
@@ -270,7 +273,12 @@ subroutine systemSolv(&
   ! flags
   logical(lgt) :: return_flag ! flag for handling systemSolv returns trigerred from internal subroutines 
   logical(lgt) :: exit_flag   ! flag for handling loop exit statements trigerred from internal subroutines 
+  ! one copy of the scratch arrays per thread
+  !$omp threadprivate(stateVecNew, fluxVec0, dMat, sMul, rAdd, atol, rtol, mLayerTempPrime, mLayerVolFracWatPrime, &
+  !$omp& fScale, xScale, resVecNew)
   ! -----------------------------------------------------------------------------------------------------------
+  call sizeScratch(1,nState,stateVecNew, fluxVec0, dMat, sMul, rAdd, atol, rtol, fScale, xScale, resVecNew)
+  call sizeScratch(1,nLayers,mLayerTempPrime, mLayerVolFracWatPrime)
 
   call initialize_systemSolv; if (return_flag) return ! initialize variables and allocate arrays -- return if error
 
@@ -333,7 +341,7 @@ contains
 
    ! identify the matrix solution method, using the full matrix can be slow in many-layered systems
    ! (the type of matrix used to solve the linear system A.X=B)
-   if (local_ixGroundwater==qbaseTopmodel .or. (nGlce>0 .and. nSoil>0) .or. scalarSolution .or. forceFullMatrix .or. computeVegFlux) then
+   if (soilLateralFlow .or. (nGlce>0 .and. nSoil>0) .or. scalarSolution .or. forceFullMatrix .or. computeVegFlux) then
      nLeadDim=nState         ! length of the leading dimension
      ixMatrix=ixFullMatrix   ! named variable to denote the full Jacobian matrix
    else
@@ -363,7 +371,7 @@ contains
    ixGroundwater     => model_decisions(iLookDECISIONS%groundwatr)%iDecision & ! intent(in): [i4b] groundwater parameterization
    &)
    ! allocate space for the model fluxes at the start of the time step
-   call allocLocal(flux_meta(:),flux_init,nSnow,nLake,nSoil,nGlce,0_i4b,err,cmessage)
+   call allocCached(ixCache_systemSolvInit,flux_meta(:),flux_init,nSnow,nLake,nSoil,nGlce,err,cmessage)
    if (err/=0) then; err=20; message=trim(message)//trim(cmessage); return_flag=.true.; return; end if
 
    ! allocate space for mLayerCmpress_sum at the start of the time step
@@ -376,7 +384,7 @@ contains
    end if
 
    ! allocate space for the baseflow derivatives
-   if(ixGroundwater==qbaseTopmodel .or. (nGlce>0 .and. nSoil>0))then ! need the baseflow derivatives if have TOPMODEL groundwater or glacier debris (since debris has lateral flow)
+   if(soilLateralFlow .or. (nGlce>0 .and. nSoil>0))then ! need the baseflow derivatives if have TOPMODEL groundwater or glacier debris (since debris has lateral flow)
      allocate(dBaseflow_dWat(nSoil,nSoil),dBaseflow_dTk(nSoil,nSoil),stat=err)
    else
      allocate(dBaseflow_dWat(0,0),dBaseflow_dTk(0,0),stat=err)
@@ -613,9 +621,28 @@ contains
   ! check convergence
   if (iter==localMaxiter) then
     message=trim(message)//'failed to converge'
+    call pinned_at_freezing
     err=-20; return_flag=.true.; return
   end if
  end subroutine check_Newton_convergence    
+
+ subroutine pinned_at_freezing
+  ! ** Flag too much melt when the top frozen layer is held at the freezing point: it is all liquid and cannot take more energy **
+  integer(i4b) :: top ! index of the top frozen layer
+  associate(&
+   nSnow         => indx_data%var(iLookINDEX%nSnow)%dat(1)    ,& ! intent(in): [i4b]    number of snow layers
+   nLake         => indx_data%var(iLookINDEX%nLake)%dat(1)    ,& ! intent(in): [i4b]    number of lake layers
+   nSoil         => indx_data%var(iLookINDEX%nSoil)%dat(1)    ,& ! intent(in): [i4b]    number of soil layers
+   nGlce         => indx_data%var(iLookINDEX%nGlce)%dat(1)    ,& ! intent(in): [i4b]    number of glacier ice layers
+   ixSnLaSoGlNrg => indx_data%var(iLookINDEX%ixSnLaSoGlNrg)%dat & ! intent(in): [i4b(:)] index of the energy state of each layer in the subset
+   &)
+   if (nSnow+nGlce==0) return
+   top = 1
+   if (nSnow==0) top = 1 + nSoil + nLake
+   if (ixSnLaSoGlNrg(top)==integerMissing) return
+   if (stateVecTrial(ixSnLaSoGlNrg(top)) > Tfreeze - 1.e-6_rkind) tooMuchMelt = .true.
+  end associate
+ end subroutine pinned_at_freezing
 
  subroutine enforce_mass_conservation
   ! Post processing step to “perfectly” conserve mass by pushing the errors into the state variables
@@ -631,7 +658,8 @@ contains
   
     ! update temperatures (ensure new temperature is consistent with the fluxes)
     if (nSnLaSoGlNrg>0) then
-      do concurrent (iLayer=1:nLayers,ixSnLaSoGlNrg(iLayer)/=integerMissing) ! loop through non-missing energy state variables in the layer domains
+      do iLayer=1,nLayers ! loop through non-missing energy state variables in the layer domains
+        if(ixSnLaSoGlNrg(iLayer)==integerMissing) cycle
         iState = ixSnLaSoGlNrg(iLayer)
         stateVecTrial(iState) = stateVecInit(iState) + (fluxVec(iState)*dt_cur + resSink(iState))/real(sMul(iState), rkind)
         resVec(iState) = 0._qp
@@ -641,7 +669,8 @@ contains
     ! update volumetric water content in the snow (ensure change in state is consistent with the fluxes)
     ! NOTE: for soil water balance is constrained within the iteration loop
     if (nSnLaSoGlHyd>0) then
-      do concurrent (iLayer=1:nSnow,ixSnLaSoGlHyd(iLayer)/=integerMissing)   ! (loop through non-missing water state variables in the snow domain)
+      do iLayer=1,nSnow   ! (loop through non-missing water state variables in the snow domain)
+        if(ixSnLaSoGlHyd(iLayer)==integerMissing) cycle
         iState = ixSnLaSoGlHyd(iLayer)
         stateVecTrial(iState) = stateVecInit(iState) + (fluxVec(iState)*dt_cur + resSink(iState))
         resVec(iState) = 0._qp
@@ -673,7 +702,7 @@ contains
    nGlce => indx_data%var(iLookINDEX%nGlce)%dat(1) & ! intent(in): [i4b] number of glacier ice layers
    )
    ! allocate space for the temporary flux_sum structure
-   call allocLocal(flux_meta(:),flux_sum,nSnow,nLake,nSoil,nGlce,0_i4b,err,cmessage)
+   call allocCached(ixCache_systemSolvSum,flux_meta(:),flux_sum,nSnow,nLake,nSoil,nGlce,err,cmessage)
    if (err/=0) then; err=20; message=trim(message)//trim(cmessage); return; end if
 
    ! initialize flux_sum

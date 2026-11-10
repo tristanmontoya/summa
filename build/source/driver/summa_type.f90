@@ -65,9 +65,13 @@ USE data_types,  only : &
                     gru2hru_map,           & ! x(iGRU)%hruinfo(iHRU)%y
                     hru2gru_map              ! x(iHRU)%y
 USE data_types,      only: q_coupling      ! x(:)%id, x(:)%qsim
+USE data_types,      only: lake_coupling   ! x(:)%id, x(:)%precip, x(:)%evap
 
 ! access missing values
 USE globalData,only:integerMissing      ! missing integer
+
+! parallelism
+USE parallel_context, only: parallel_context_type
 
 ! objective function
 USE data_types,      only: obs_fileinfo    ! information on the observation file
@@ -82,6 +86,9 @@ implicit none
 
 private
 
+! re-export parallel context so available with summa_type use statements
+public :: parallel_context_type
+
 ! ***********************************************************************************************************
 ! Configuration information shared across SUMMA simulations.
 !
@@ -91,22 +98,32 @@ private
 type, public :: config_info
   ! logging
   integer(i4b)                   :: iulog_summa = output_unit ! output unit for log files
+  ! paths for a specific experiment
+  character(len=1024)            :: cwd                     ! Current working directory
+  character(len=:),  allocatable :: home_path_override      ! Command-line override for home_path
+  character(len=:),  allocatable :: persistent_output       ! Directory for persistent output
   ! configuration flags
   logical(lgt)                   :: read_cli = .true.       ! .true. = read command-line interface
   logical(lgt)                   :: read_config = .true.    ! .true. = read configuration files
   ! Multi-case configuration
+  logical(lgt)                   :: is_case_root = .true.   ! .true. for rank 0 within a model case
   integer(i4b)                   :: cases_per_node = 1      ! Number of concurrent cases per node
   character(len=:),  allocatable :: manifest_file           ! Path and name of the multi-case manifest
   character(len=64), allocatable :: case_names(:)           ! Names of cases defined in the manifest
   character(len=:),  allocatable :: manifest_casename       ! Case name selected from the run manifest
   character(len=:),  allocatable :: template_path           ! Path to the SUMMA configuration template
   character(len=:),  allocatable :: template_file           ! SUMMA configuration template filename
+  character(len=:),  allocatable :: experiment              ! Experiment identifier, e.g., exp01
+  integer(i4b)                   :: n_runs = 1              ! Number of independent optimization runs (different seed)
+  integer(i4b)                   :: run_index = 1           ! Index of indepndent optimization run
   ! SUMMA configuration options from the CLI (-g and -h)
   integer(i4b)                   :: nGRU_user = -1          ! Number of GRUs requested by the user
   integer(i4b)                   :: nHRU_check = 1          ! HRU used for diagnostic checks
   ! Parameter overrides
   character(len=64), allocatable :: param_name(:)           ! Names of parameters to override
   real(rkind),       allocatable :: param_value(:)          ! Values of parameter overrides
+  ! Parameters explicitly present in the trial parameter file
+  character(len=64), allocatable :: trial_param_names(:)    ! Names of trial parameters
   ! Simulation
   character(len=:), allocatable  :: home_path               ! Root path for user-specific files
   character(len=:), allocatable  :: basin_dir               ! Directory containing basin-specific input data
@@ -145,15 +162,6 @@ type, public :: config_info
   type(mizuroute_info)           :: mizu_info               ! mizuRoute configuration infirmation
 #endif
 end type config_info
-
-! ************************************************************************
-! * parallel communication context
-! ************************************************************************
-type, public :: parallel_context_type
-  integer(I4B) :: comm = -1
-  integer(I4B) :: rank = 0
-  integer(I4B) :: size = 1
-end type parallel_context_type
 
 ! ************************************************************************
 ! * top-level summa data type
@@ -207,6 +215,7 @@ type, public :: summa1_type_dec
     integer(i4b)                     :: n_write                    ! length of the output buffer
     ! generic runoff coupling data
     type(q_coupling), allocatable    :: coupling(:)                ! x(:)%id, x(:)%qsim
+    type(lake_coupling), allocatable :: coupling_lake(:)          ! x(:)%id, x(:)%precip, x(:)%evap: one per water-class HRU
 #ifdef MIZUROUTE_ACTIVE
     type(mizuroute_domain)           :: mizu_domain                ! mizuroute domain data
 #endif

@@ -22,6 +22,7 @@ module matrixOper_module
 
 ! data types
 USE nr_type
+USE scratch_module,only:sizeScratch  ! size the per-thread scratch arrays
 
 ! access named variables to describe the form and structure of the matrices used in the numerical solver
 USE globalData,only: nRHS           ! number of unknown variables on the RHS of the linear system A.X=B
@@ -71,8 +72,8 @@ contains
   case(ixFullMatrix)
 
    ! scale by both the scaling factors for the function (fScale) and variable (xScale)
-   do iState=1,nState
-    do jState=1,nState
+   do jState=1,nState
+    do iState=1,nState
      aJacScaled(iState,jState) = fScale(iState)*aJac(iState,jState)*xScale(jState)
     end do
    end do
@@ -148,21 +149,26 @@ contains
 
 
  ! *********************************************************************************************************
- ! public subroutine lapackSolv: use the lapack routines to solve the linear system A.X=B
+ ! public subroutine lapackSolv: use the lapack routines to solve the linear system A.X=-r for the newton step X
  ! *********************************************************************************************************
  subroutine lapackSolv(ixMatrix,nState,aJac,rVec,xInc,err,message)
  implicit none
  ! dummy
  integer(i4b),intent(in)        :: ixMatrix      ! type of matrix (full Jacobian or band diagonal)
  integer(i4b),intent(in)        :: nState        ! number of state variables
- real(rkind),intent(inout)      :: aJac(:,:)     ! input = the Jacobian matrix A; output = decomposed matrix
- real(rkind),intent(in)         :: rVec(:)       ! the residual vector B
+ real(rkind),intent(inout),contiguous :: aJac(:,:) ! input = the Jacobian matrix A; output = decomposed matrix
+ real(rkind),intent(in)         :: rVec(:)       ! the residual vector r
  real(rkind),intent(out)        :: xInc(:)       ! the solution vector X
  integer(i4b),intent(out)       :: err           ! error code
  character(*),intent(out)       :: message       ! error message
  ! local
- real(rkind)                    :: rhs(nState,1) ! the nState-by-nRHS matrix of matrix B, for the linear system A.X=B
- integer(i4b)                   :: iPiv(nState)  ! defines if row i of the matrix was interchanged with row iPiv(i)
+ real(rkind),allocatable,save   :: rhs(:,:)      ! the nState-by-nRHS matrix of matrix B, for the linear system A.X=B
+ integer(i4b),allocatable,save  :: iPiv(:)       ! defines if row i of the matrix was interchanged with row iPiv(i)
+ ! one copy of the scratch arrays per thread
+ !$omp threadprivate(rhs, iPiv)
+ call sizeScratch(nState,1,rhs)
+ call sizeScratch(1,nState,iPiv)
+
  ! initialize error control
  select case(ixMatrix)
   case(ixFullMatrix); message='lapackSolv/dgesv/'
@@ -174,7 +180,7 @@ contains
 
  ! form the rhs matrix
  ! NOTE: copy the vector here to ensure that the residual vector is not overwritten
- rhs(:,1) = rVec(:)
+ rhs(:,1) = -rVec(:)
 
  ! identify option to solve the linear system A.X=B
  select case(ixMatrix)

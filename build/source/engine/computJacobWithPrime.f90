@@ -39,6 +39,7 @@ USE var_lookup,only:iLookDERIV      ! named variables for structure elements
 
 ! access the global print flag
 USE globalData,only:globalPrintFlag
+USE globalData,only:soilLateralFlow ! flag: soil layers drain laterally
 
 ! access missing values
 USE globalData,only:integerMissing  ! missing integer
@@ -443,7 +444,11 @@ subroutine computJacobWithPrime(&
       endif
       
       if(ixVegNrg/=integerMissing)then
-        if(ixVegHyd/=integerMissing) aJac(watRows,ixVegHyd) = aJac(watRows,ixVegHyd) + aJac(nrgRows,ixVegNrg) * dCanopyTemp_dCanWat
+        if(ixVegHyd/=integerMissing)then
+          do jLayer=1,size(watRows)
+            aJac(watRows(jLayer),ixVegHyd) = aJac(watRows(jLayer),ixVegHyd) + aJac(nrgRows(jLayer),ixVegNrg) * dCanopyTemp_dCanWat
+          end do
+        endif
         aJac(:,ixVegNrg) = aJac(:,ixVegNrg) * dCanopyTemp_dEnthalpy
         aJac(ixInd(full,ixVegNrg,ixVegNrg),ixVegNrg) = aJac(ixInd(full,ixVegNrg,ixVegNrg),ixVegNrg) + 1._rkind * cj
       endif
@@ -455,9 +460,13 @@ subroutine computJacobWithPrime(&
           watState = ixSnLaSoGlHyd(iLayer)
           if(watState/=integerMissing)then 
             if(iLayer<=nSnow+nLake .or. iLayer>nSnow+nLake+nSoil)then
-              aJac(watRows,watState) = aJac(watRows,watState) + aJac(nrgRows,nrgState) * dTemp_dTheta(iLayer)
+              do jLayer=1,size(watRows)
+                aJac(watRows(jLayer),watState) = aJac(watRows(jLayer),watState) + aJac(nrgRows(jLayer),nrgState) * dTemp_dTheta(iLayer)
+              end do
             else
-              aJac(watRows,watState) = aJac(watRows,watState) + aJac(nrgRows,nrgState) * dTemp_dPsi0(iLayer-nSnow-nLake)
+              do jLayer=1,size(watRows)
+                aJac(watRows(jLayer),watState) = aJac(watRows(jLayer),watState) + aJac(nrgRows(jLayer),nrgState) * dTemp_dPsi0(iLayer-nSnow-nLake)
+              end do
             endif
           endif
           aJac(:,nrgState) = aJac(:,nrgState) * dTemp_dEnthalpy(iLayer)
@@ -553,7 +562,7 @@ integer(c_int) function computJacob4ida(t, cj, sunvec_y, sunvec_yp, sunvec_r, &
                 eqns_data%nGlce,                          & ! intent(in):    number of glacier ice layers
                 eqns_data%nLayers,                        & ! intent(in):    total number of layers
                 eqns_data%computeVegFlux,                 & ! intent(in):    flag to indicate if we need to compute fluxes over vegetation
-                eqns_data%model_decisions(iLookDECISIONS%groundwatr)%iDecision==qbaseTopmodel, & ! intent(in): flag to indicate if we need to compute baseflow
+                soilLateralFlow,                                                               & ! intent(in): flag to indicate if we need to compute baseflow
                 eqns_data%ixMatrix,                                                            & ! intent(in): form of the Jacobian matrix
                 eqns_data%mpar_data%var(iLookPARAM%specificStorage)%dat(1),                    & ! intent(in): specific storage coefficient (m-1)
                 eqns_data%mpar_data%var(iLookPARAM%theta_sat)%dat,                             & ! intent(in): soil porosity (-)

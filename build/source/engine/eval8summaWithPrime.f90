@@ -3,6 +3,7 @@ module eval8summaWithPrime_module
 
 ! data types
 USE nr_type
+USE scratch_module,only:sizeScratch  ! size the per-thread scratch arrays
 
 ! access missing values
 USE globalData,only:integerMissing  ! missing integer
@@ -183,11 +184,11 @@ subroutine eval8summaWithPrime(&
   real(rkind)                     :: scalarCanairTempTrial       ! trial value for temperature of the canopy air space (K)
   real(rkind)                     :: scalarCanopyLiqTrial        ! trial value for liquid water storage in the canopy (kg m-2)
   real(rkind)                     :: scalarCanopyIceTrial        ! trial value for ice storage in the canopy (kg m-2)
-  real(rkind),dimension(nSoil)    :: mLayerMatricHeadLiqTrial    ! trial value for liquid water matric potential (m)
-  real(rkind),dimension(nLayers)  :: mLayerEnthalpyTrial         ! trial vector of enthalpy of each layer (J m-3)
-  real(rkind),dimension(nLayers)  :: mLayerVolFracWatTrial       ! trial vector of volumetric total water content (-)
-  real(rkind),dimension(nLayers)  :: mLayerVolFracLiqTrial       ! trial vector of volumetric liquid water content (-)
-  real(rkind),dimension(nLayers)  :: mLayerVolFracIceTrial       ! trial vector of volumetric fraction of ice (-)
+  real(rkind),allocatable,save    :: mLayerMatricHeadLiqTrial(:) ! trial value for liquid water matric potential (m)
+  real(rkind),allocatable,save    :: mLayerEnthalpyTrial(:)      ! trial vector of enthalpy of each layer (J m-3)
+  real(rkind),allocatable,save    :: mLayerVolFracWatTrial(:)    ! trial vector of volumetric total water content (-)
+  real(rkind),allocatable,save    :: mLayerVolFracLiqTrial(:)    ! trial vector of volumetric liquid water content (-)
+  real(rkind),allocatable,save    :: mLayerVolFracIceTrial(:)    ! trial vector of volumetric fraction of ice (-)
   real(rkind)                     :: scalarAquiferStorageTrial   ! trial value for storage of water in the aquifer (m)
   ! prime state variables
   real(rkind)                     :: scalarCanairEnthalpyPrime   ! prime value for enthalpy of the canopy air space (W m-3)
@@ -195,20 +196,19 @@ subroutine eval8summaWithPrime(&
   real(rkind)                     :: scalarCanopyEnthalpyPrime   ! prime value for enthalpy of the vegetation canopy (W m-3)
   real(rkind)                     :: scalarCanopyLiqPrime        ! prime value for liquid water storage in the canopy (kg m-2 s-1)
   real(rkind)                     :: scalarCanopyIcePrime        ! prime value for mass of ice on the vegetation canopy (kg m-2 s-1)
-  real(rkind),dimension(nLayers)  :: mLayerEnthalpyPrime         ! prime vector of enthalpy of each layer (W m-3)
-  real(rkind),dimension(nLayers)  :: mLayerVolFracLiqPrime       ! prime vector of volumetric liquid water content (s-1)
-  real(rkind),dimension(nLayers)  :: mLayerVolFracIcePrime       ! prime vector of volumetric fraction of ice (s-1)
-  real(rkind),dimension(nSoil)    :: mLayerMatricHeadLiqPrime    ! prime vector of liquid water matric potential (m s-1)
+  real(rkind),allocatable,save    :: mLayerEnthalpyPrime(:)      ! prime vector of enthalpy of each layer (W m-3)
+  real(rkind),allocatable,save    :: mLayerVolFracLiqPrime(:)    ! prime vector of volumetric liquid water content (s-1)
+  real(rkind),allocatable,save    :: mLayerVolFracIcePrime(:)    ! prime vector of volumetric fraction of ice (s-1)
+  real(rkind),allocatable,save    :: mLayerMatricHeadLiqPrime(:) ! prime vector of liquid water matric potential (m s-1)
   real(rkind)                     :: scalarAquiferStoragePrime   ! prime value of storage of water in the aquifer (m s-1)
   ! dummy state variables
   real(rkind)                     :: scalarCanairNrgTrial        ! trial value for energy of the canopy air space
   real(rkind)                     :: scalarCanopyNrgTrial        ! trial value for energy of the vegetation canopy
-  real(rkind),dimension(nLayers)  :: mLayerNrgTrial              ! trial vector of energy of each layer
+  real(rkind),allocatable,save    :: mLayerNrgTrial(:)           ! trial vector of energy of each layer
   real(rkind)                     :: scalarCanairNrgPrime        ! prime value for energy of the canopy air space
   real(rkind)                     :: scalarCanopyNrgPrime        ! prime value for energy of the vegetation canopy
-  real(rkind),dimension(nLayers)  :: mLayerNrgPrime              ! prime vector of energy of each layer
+  real(rkind),allocatable,save    :: mLayerNrgPrime(:)           ! prime vector of energy of each layer
   ! other local variables
-  integer(i4b)                    :: ixLayerDesired(1)           ! layer desired (scalar solution)
   integer(i4b)                    :: ixTop,ixBot                 ! top and bottom defining desired layers
   character(LEN=256)              :: cmessage                    ! error message of downwind routine
   logical(lgt)                    :: updateStateCp               ! flag to indicate if we update Cp at each step for LHS, set with nrgConserv choice and updateCp_closedForm flag
@@ -216,6 +216,15 @@ subroutine eval8summaWithPrime(&
   logical(lgt)                    :: needStateCm                 ! flag to indicate if the energy equation contains LHS Cm = dH_T/dTheta_m,, set with nrgConserv choice and needStateCm_closedForm flag
   logical(lgt),parameter          :: updateCp_closedForm=.true. ! nrgConserv = closedForm flag to indicate if we update Cp at each step
   logical(lgt),parameter          :: needCm_closedForm=.true.   ! nrgConserv = closedForm flag to indicate if the energy equation contains Cm = dH_T/dTheta_m
+  ! one copy of the scratch arrays per thread
+  !$omp threadprivate(mLayerEnthalpyTrial, mLayerVolFracWatTrial, mLayerVolFracLiqTrial, mLayerVolFracIceTrial, &
+  !$omp& mLayerEnthalpyPrime, mLayerVolFracLiqPrime, mLayerVolFracIcePrime, mLayerNrgTrial, mLayerNrgPrime, &
+  !$omp& mLayerMatricHeadLiqTrial, mLayerMatricHeadLiqPrime)
+
+  call sizeScratch(1,nLayers,mLayerEnthalpyTrial, mLayerVolFracWatTrial, mLayerVolFracLiqTrial, &
+                  &mLayerVolFracIceTrial, mLayerEnthalpyPrime, mLayerVolFracLiqPrime, mLayerVolFracIcePrime, &
+                  &mLayerNrgTrial, mLayerNrgPrime)
+  call sizeScratch(1,nSoil,mLayerMatricHeadLiqTrial, mLayerMatricHeadLiqPrime)
 
   ! --------------------------------------------------------------------------------------------------------------------------------
   ! association to variables in the data structures
@@ -629,9 +638,8 @@ subroutine eval8summaWithPrime(&
     ! NOTE: we already extracted trial matrix head and volumetric liquid water as part of the flux calculations
     if(nSoil>0)then
       if(scalarSolution)then
-        ixLayerDesired = pack(ixControlVolume, ixMapFull2Subset/=integerMissing)
-        ixTop  = ixLayerDesired(1)
-        ixBot  = ixLayerDesired(1)
+        ixTop  = ixControlVolume(findloc(ixMapFull2Subset/=integerMissing, .true., 1)) ! layer of the first state in the subset
+        ixBot  = ixTop
       else
         ixTop  = 1
         ixBot  = nSoil
@@ -742,6 +750,7 @@ integer(c_int) function eval8summa4ida(tres, sunvec_y, sunvec_yp, sunvec_r, user
   real(rkind), pointer        :: stateVecPrime(:) ! derivative vector
   real(rkind), pointer        :: rVec(:)          ! residual vector
   logical(lgt)                :: feasible         ! feasibility of state vector
+  integer(i4b)                :: iState           ! index of state
   !======= Internals ============
 
   ! get equations data from user-defined data
@@ -811,7 +820,9 @@ integer(c_int) function eval8summa4ida(tres, sunvec_y, sunvec_yp, sunvec_r, user
   if(eqns_data%err < 0)then; eqns_data%message=trim(eqns_data%message); ierr=1; return; endif
 
   ! save residual and return success
-  eqns_data%resVec = rVec
+  do iState=1,eqns_data%nState
+    eqns_data%resVec(iState) = rVec(iState)
+  end do
   ierr = 0
   return
 

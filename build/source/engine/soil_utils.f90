@@ -42,13 +42,31 @@ public::volFracLiq
 public::matricHead
 public::dTheta_dPsi
 public::dPsi_dTheta
+public::satDeficit
+public::log1pAcc
+public::expm1Acc
 public::RH_soilair
 public::dTheta_dTk
 public::crit_soilT
+public::dCritSoilT_dPsi
+public::smoothHead
+public::dSmoothHead_dPsi
+public::d2SmoothHead_dPsi2
+public::volFracTot
+public::dVolFracTot_dPsi
+public::matricHeadTot
+public::unsmoothHead
+public::dUnsmoothHead_dPsi
+public::dPsiLiqFrozen_dPsi0
 public::liquidHead
+public::psiSmooth
 public::gammp,gammp_complex
+public::dgammp_dx
 public::LogSumExp
 public::SoftArgMax
+real(rkind),parameter :: kBlendHead=1.e-3_rkind ! matric head below saturation over which hydraulic conductivity blends to k_sat (m)
+real(rkind),parameter :: psiSmooth=1.e-2_rkind  ! width of the smooth min(psi,0) that total water and the critical temperature see (m)
+
 contains
 
 ! ******************************************************************************************************************************
@@ -96,7 +114,6 @@ subroutine liquidHead(&
                      volFracLiq                               ,& ! intent(in)    : volumetric fraction of liquid water (-)
                      volFracIce                               ,& ! intent(in)    : volumetric fraction of ice (-)
                      vGn_alpha,vGn_n,theta_sat,theta_res,vGn_m,& ! intent(in)    : soil parameters
-                     dVolTot_dPsi0                            ,& ! intent(in)    : derivative in total volumetric water content w.r.t. matric head (m-1)
                      dTheta_dT                                ,& ! intent(in)    : derivative in volumetric liquid water w.r.t. temperature (K-1)
                      ! output
                      matricHeadLiq                            ,& ! intent(out)   : liquid water matric potential (m)
@@ -109,7 +126,6 @@ subroutine liquidHead(&
   real(rkind),intent(in)            :: volFracLiq                                ! volumetric fraction of liquid water (-)
   real(rkind),intent(in)            :: volFracIce                                ! volumetric fraction of ice (-)
   real(rkind),intent(in)            :: vGn_alpha,vGn_n,theta_sat,theta_res,vGn_m ! soil parameters
-  real(rkind),intent(in)  ,optional :: dVolTot_dPsi0                             ! derivative in total volumetric water content w.r.t. matric head (m-1)
   real(rkind),intent(in)  ,optional :: dTheta_dT                                 ! derivative in volumetric liquid water w.r.t. temperature (K-1)
   ! output
   real(rkind),intent(out)           :: matricHeadLiq                             ! liquid water matric potential (m)
@@ -123,12 +139,15 @@ subroutine liquidHead(&
   real(rkind)                       :: effSat                                    ! effective saturation (-)
   real(rkind)                       :: dPsiLiq_dEffSat                           ! derivative in liquid water matric potential w.r.t. effective saturation (m)
   real(rkind)                       :: dEffSat_dTemp                             ! derivative in effective saturation w.r.t. temperature (K-1)
+  real(rkind)                       :: xDef                                      ! saturation deficit of the total water, theta_sat - volFracLiq - volFracIce (-)
+  real(rkind)                       :: satTerm                                   ! effSat**(-1/m) - 1 (-)
+  real(rkind)                       :: psiSL                                     ! smoothed liquid head on the van Genuchten curve (m)
    ! ------------------------------------------------------------------------------------------------------------------------------
   ! initialize error control
   err=0; message='liquidHead/'
 
   ! ** partially frozen soil
-  if(volFracIce > epsilon(1._rkind) .and. matricHeadTotal < 0._rkind)then  ! check that ice exists and that the soil is unsaturated
+  if(volFracIce > epsilon(1._rkind))then  ! check that ice exists
 
     ! -----
     ! - compute liquid water matric potential...
@@ -138,16 +157,23 @@ subroutine liquidHead(&
     ! NOTE: include ice content as part of the solid porosity - major effect of ice is to reduce the pore size; ensure that effSat=1 at saturation
     ! (from Zhao et al., J. Hydrol., 1997: Numerical analysis of simultaneous heat and mass transfer...)
     xNum   = volFracLiq - theta_res
-    xDen   = theta_sat - volFracIce - theta_res
-    effSat = xNum/xDen          ! effective saturation
+    xDef   = satDeficit(smoothHead(matricHeadTotal),vGn_alpha,theta_sat,theta_res,vGn_n,vGn_m)
+    xDen   = xNum + xDef  ! theta_sat - volFracIce - theta_res, without cancellation near saturation
+    effSat = xNum/xDen    ! effective saturation
 
-    ! - matric head associated with liquid water
-    matricHeadLiq = matricHead(effSat,vGn_alpha,0._rkind,1._rkind,vGn_n,vGn_m)  ! argument is effective saturation, so theta_res=0 and theta_sat=1
-
-    ! compute derivative in liquid water matric potential w.r.t. effective saturation (m)
-    if(present(dPsiLiq_dPsi0).or.present(dPsiLiq_dTemp))then
+    ! - matric head associated with liquid water, and its derivative w.r.t. effective saturation (m)
+    satTerm = 0._rkind
+    if(xNum > 0._rkind) satTerm = expm1Acc(-log1pAcc(-xDef/xDen)/vGn_m) ! effSat**(-1/m) - 1 from 1-effSat, smooth as effSat -> 1
+    if(satTerm > 0._rkind)then
+      matricHeadLiq   = satTerm**(1._rkind/vGn_n)/vGn_alpha
+      dPsiLiq_dEffSat = -satTerm**(1._rkind/vGn_n - 1._rkind)*effSat**(-1._rkind/vGn_m - 1._rkind)/(vGn_alpha*vGn_n*vGn_m)
+    else
+      matricHeadLiq   = matricHead(effSat,vGn_alpha,0._rkind,1._rkind,vGn_n,vGn_m)  ! argument is effective saturation, so theta_res=0 and theta_sat=1
       dPsiLiq_dEffSat = dPsi_dTheta(effSat,vGn_alpha,0._rkind,1._rkind,vGn_n,vGn_m)
     endif
+    psiSL           = matricHeadLiq
+    dPsiLiq_dEffSat = dPsiLiq_dEffSat*dUnsmoothHead_dPsi(psiSL)
+    matricHeadLiq   = unsmoothHead(psiSL) + max(matricHeadTotal - psiSmooth, 0._rkind) ! retention curve at smoothHead(matricHeadLiq); the total head above psiSmooth
 
     ! -----
     ! - compute derivative in the liquid water matric potential w.r.t. the total water matric potential...
@@ -155,13 +181,8 @@ subroutine liquidHead(&
 
     ! check if the derivative is desired
     if(present(dPsiLiq_dPsi0))then
-      ! (check required input derivative is present)
-      if(.not.present(dVolTot_dPsi0))then
-        message=trim(message)//'dVolTot_dPsi0 argument is missing'
-        err=20; return
-      endif
-      ! (compute derivative in the liquid water matric potential w.r.t. the total water matric potential)
-      dPsiLiq_dPsi0 = dVolTot_dPsi0*dPsiLiq_dEffSat*xNum/(xDen**2_i4b)
+      dPsiLiq_dPsi0 = dPsiLiqFrozen_dPsi0(smoothHead(matricHeadTotal),psiSL,xNum,xDen,vGn_alpha,theta_res,theta_sat,vGn_n,vGn_m)
+      if(matricHeadTotal > psiSmooth) dPsiLiq_dPsi0 = dPsiLiq_dPsi0 + 1._rkind
     endif  ! if dPsiLiq_dTemp is desired
 
     ! -----
@@ -233,15 +254,18 @@ function hydCond_psi(psi,k_sat,alpha,n,m)
   ! Blend over the interval [-delta,0] using a cubic smoothstep so that value
   ! and first derivative are continuous at the join.
   real(rkind) :: t, s, orig_val
+  real(rkind) :: xn1, sm      ! (alpha psi)**(n-1) and (1 + (alpha psi)**n)**(-m)
 
   if (psi >= 0._rkind) then
     hydCond_psi = k_sat
   else
-    orig_val = k_sat * ( ( (1._rkind - (psi*alpha)**(n-1._rkind) * (1._rkind + (psi*alpha)**n)**(-m))**2_i4b ) / ( (1._rkind + (psi*alpha)**n)**(m/2._rkind) ) )
-    if (psi < -verySmall) then
+    xn1 = (psi*alpha)**(n-1._rkind)
+    sm  = (1._rkind + xn1*psi*alpha)**(-m)
+    orig_val = k_sat * (1._rkind - xn1*sm)**2_i4b * sqrt(sm)
+    if (psi < -kBlendHead) then
       hydCond_psi = orig_val
     else ! compute original formula and blend to k_sat using a cubic smoothstep
-      t = (psi + verySmall) / verySmall
+      t = (psi + kBlendHead) / kBlendHead
       s = 3._rkind*t*t - 2._rkind*t*t*t     ! cubic smoothstep: s(0)=0, s(1)=1, continuous first derivative
       hydCond_psi = orig_val*(1._rkind - s) + k_sat*s
     end if
@@ -310,10 +334,13 @@ function dTheta_dPsi(psi,alpha,theta_res,theta_sat,n,m)
   real(rkind),intent(in) :: n           ! vGn "n" parameter (-)
   real(rkind),intent(in) :: m           ! vGn "m" parameter (-)
   real(rkind)            :: dTheta_dPsi ! derivative of the soil water characteristic (m-1)
+  real(rkind)            :: xn1         ! (alpha psi)**(n-1)
+  real(rkind)            :: s           ! 1 + (alpha psi)**n
 
   if(psi<=0._rkind)then
-    dTheta_dPsi = (theta_sat-theta_res) * &
-                 (-m*(1._rkind + (psi*alpha)**n)**(-m-1._rkind)) * n*(psi*alpha)**(n-1._rkind) * alpha
+    xn1 = (psi*alpha)**(n-1._rkind)
+    s   = 1._rkind + xn1*psi*alpha
+    dTheta_dPsi = (theta_sat-theta_res) * (-m*s**(-m)/s) * n*xn1 * alpha
     if(abs(dTheta_dPsi) < epsilon(psi)) dTheta_dPsi = epsilon(psi) ! use to avoid division by zero if divide by dTheta_dPsi
   else
     dTheta_dPsi = epsilon(psi) ! use to avoid division by zero if divide by dTheta_dPsi
@@ -346,14 +373,16 @@ function dPsi_dTheta(volFracLiq,alpha,theta_res,theta_sat,n,m)
    ! compute effective water content
    theta_e = max(theta_e_min,(volFracLiq - theta_res) / (theta_sat - theta_res))
    ! compute the 1st function and derivative
-   y1 = theta_e**(-1._rkind/m) - 1._rkind
-   d1 = (-1._rkind/m)*theta_e**(-1._rkind/m - 1._rkind) / (theta_sat - theta_res)
+   y1 = theta_e**(-1._rkind/m)
+   d1 = (-1._rkind/m)*(y1/theta_e) / (theta_sat - theta_res)
+   y1 = y1 - 1._rkind
    ! compute the 2nd function and derivative
    ! note: impose a minimum value for y1 to avoid divison by zero and complex values
    !y2 = y1**(1._rkind/n)                         ! original expression
    !d2 = (1._rkind/n)*y1**(1._rkind/n - 1._rkind) ! original expression
-   y2 = max(y1_min,y1)**(1._rkind/n)
-   d2 = (1._rkind/n)*max(y1_min,y1)**(1._rkind/n - 1._rkind) ! impose a minimum value for y1 to avoid divison by zero and complex values
+   y1 = max(y1_min,y1)
+   y2 = y1**(1._rkind/n)
+   d2 = (1._rkind/n)*(y2/y1)
    ! compute the final function value
    dPsi_dTheta = d1*d2/alpha
   else
@@ -384,30 +413,32 @@ function dHydCond_dPsi(psi,k_sat,alpha,n,m)
   real(rkind)                :: d_nm          ! df(x)/dpsi for the numerator
   real(rkind)                :: d_dm          ! df(x)/dpsi for the denominator
   real(rkind)                :: t,s,orig_val,orig_d,ds_dpsi
+  real(rkind)                :: xs            ! 1 + (alpha psi)**n
   
   if (psi >= 0._rkind) then
     dHydCond_dPsi = 0._rkind
   else
     ! compute the derivative for the numerator (original Van Genuchten form)
     f_x1 = (psi*alpha)**(n - 1._rkind)
-    f_x2 = (1._rkind + (psi*alpha)**n)**(-m)
-    d_x1 = alpha * (n - 1._rkind)*(psi*alpha)**(n - 2._rkind)
-    d_x2 = alpha * n*(psi*alpha)**(n - 1._rkind) * (-m)*(1._rkind + (psi*alpha)**n)**(-m - 1._rkind)
+    xs   = 1._rkind + f_x1*psi*alpha
+    f_x2 = xs**(-m)
+    d_x1 = alpha * (n - 1._rkind)*f_x1/(psi*alpha)
+    d_x2 = alpha * n*f_x1 * (-m)*f_x2/xs
     f_nm = (1._rkind - f_x1*f_x2)**2_i4b
     d_nm = (-d_x1*f_x2 - f_x1*d_x2) * 2._rkind*(1._rkind - f_x1*f_x2)
     ! compute the derivative for the denominator
-    f_dm = (1._rkind + (psi*alpha)**n)**(m/2._rkind)
-    d_dm = alpha * n*(psi*alpha)**(n - 1._rkind) * (m/2._rkind)*(1._rkind + (psi*alpha)**n)**(m/2._rkind - 1._rkind)
+    f_dm = 1._rkind/sqrt(f_x2)
+    d_dm = alpha * n*f_x1 * (m/2._rkind)*f_dm/xs
     ! and combine to get the original derivative
     orig_val = k_sat * (f_nm / f_dm)
     orig_d   = k_sat*(d_nm*f_dm - d_dm*f_nm) / (f_dm**2_i4b)
-    if(psi < -verySmall) then
+    if(psi < -kBlendHead) then
       dHydCond_dPsi = orig_d
     else ! compute original formula and blend to k_sat using a cubic smoothstep
-      t = (psi + verySmall) / verySmall
+      t = (psi + kBlendHead) / kBlendHead
       t = max(0._rkind, min(1._rkind, t))
       s = 3._rkind*t*t - 2._rkind*t*t*t
-      ds_dpsi = (6._rkind*t*(1._rkind - t)) / verySmall
+      ds_dpsi = (6._rkind*t*(1._rkind - t)) / kBlendHead
       dHydCond_dPsi = orig_d*(1._rkind - s) + (k_sat - orig_val)*ds_dpsi
     end if
   end if
@@ -434,8 +465,18 @@ function crit_soilT(psi)
   implicit none
   real(rkind),intent(in) :: psi           ! matric head (m)
   real(rkind)            :: crit_soilT    ! critical soil temperature (K)
-  crit_soilT = Tfreeze + min(psi,0._rkind)*gravity*Tfreeze/LH_fus
+  crit_soilT = Tfreeze + smoothHead(psi)*gravity*Tfreeze/LH_fus
 end function crit_soilT
+
+! ******************************************************************************************************************************
+! public function dCritSoilT_dPsi: derivative of the critical soil temperature w.r.t. total matric head (K m-1)
+! ******************************************************************************************************************************
+function dCritSoilT_dPsi(psi)
+  implicit none
+  real(rkind),intent(in) :: psi             ! matric head (m)
+  real(rkind)            :: dCritSoilT_dPsi ! derivative of the critical soil temperature (K m-1)
+  dCritSoilT_dPsi = dSmoothHead_dPsi(psi)*gravity*Tfreeze/LH_fus
+end function dCritSoilT_dPsi
 
 
 ! ******************************************************************************************************************************
@@ -453,12 +494,14 @@ function dTheta_dTk(Tk,theta_res,theta_sat,alpha,n,m)
   ! local variables
   real(rkind)            :: kappa         ! constant (m K-1)
   real(rkind)            :: xtemp         ! alpha*kappa*(Tk-Tfreeze) -- dimensionless variable (used more than once)
+  real(rkind)            :: xn1           ! xtemp**(n-1)
   ! compute kappa (m K-1)
   kappa =  LH_fus/(gravity*Tfreeze)    ! NOTE: J = kg m2 s-2
   ! define a tempory variable that is used more than once (-)
   xtemp = alpha*kappa*(Tk-Tfreeze)
   ! differentiate the freezing curve w.r.t. temperature -- making use of the chain rule
-  dTheta_dTk = (alpha*kappa) * n*xtemp**(n - 1._rkind) * (-m)*(1._rkind + xtemp**n)**(-m - 1._rkind) * (theta_sat - theta_res)
+  xn1 = xtemp**(n - 1._rkind)
+  dTheta_dTk = (alpha*kappa) * n*xn1 * (-m)*(1._rkind + xn1*xtemp)**(-m - 1._rkind) * (theta_sat - theta_res)
 end function dTheta_dTk
 
 
@@ -485,6 +528,38 @@ function gammp(a,x)
    gammp=1.0_rkind-gcf(a,x)
   end if
 end function gammp
+
+
+! ******************************************************************************************************************************
+! public function dgammp_dx: derivative of the Gamma CDF w.r.t. its upper limit (i.e., the Gamma PDF with unit scale)
+! ******************************************************************************************************************************
+function dgammp_dx(a,x)
+  implicit none
+  ! input
+  real(rkind), intent(in) :: a,x
+  ! output
+  real(rkind)             :: dgammp_dx
+  ! local variables
+  real(rkind)             :: logDensity ! density in logs, so that a large shape parameter or limit cannot overflow
+  ! validation
+  if (a <= 0._rkind) then
+   stop "Error in dgammp_dx: a > 0 required."
+  end if
+  if (x < 0._rkind) then
+   stop "Error in dgammp_dx: x >= 0 required."
+  end if
+  ! computation
+  if (x == 0._rkind) then
+   dgammp_dx = 0._rkind
+   return
+  end if
+  logDensity = (a - 1._rkind)*log(x) - x - log_gamma(a)
+  if (logDensity < log(tiny(x))) then
+   dgammp_dx = 0._rkind
+  else
+   dgammp_dx = exp(logDensity)
+  end if
+end function dgammp_dx
 
 
 ! ******************************************************************************************************************************
@@ -674,20 +749,20 @@ end function gser_complex
 
 
 ! ******************************************************************************************************************************
-! public function LogSumExp: LSE (or RealSoftMax) function used for smooth approximations of max or min functions
+! public function LogSumExp: LSE (or RealSoftMax) of two values, a smooth approximation of max(x1,x2) or min(x1,x2)
 ! ******************************************************************************************************************************
-function LogSumExp(alpha,x,err) result(LSE)
+function LogSumExp(alpha,x1,x2,err) result(LSE)
   use, intrinsic :: ieee_arithmetic,only:ieee_value,ieee_is_normal,ieee_quiet_nan
   use, intrinsic :: iso_fortran_env,only:real128
   implicit none
   ! input
   real(rkind),intent(in) :: alpha ! smoothness parameter (LSE --> max as alpha --> +Inf, LSE --> min as alpha --> -Inf)
-  real(rkind),intent(in) :: x(:)  ! vector of input values
+  real(rkind),intent(in) :: x1,x2 ! input values
   ! output
   real(rkind)              :: LSE ! LogSumExp value 
   integer(i4b),intent(out) :: err ! error code
   ! local variables
-  real(real128),allocatable :: x_qp(:) ! quadruple precision x vector
+  real(real128) :: x1_qp,x2_qp ! quadruple precision input values
   real(real128) :: x_star   ! quadruple precision shift value for numerical stability
   real(real128) :: alpha_qp ! quadruple precision alpha
   real(real128) :: LSE_qp   ! quadruple precision LSE value 
@@ -703,13 +778,13 @@ function LogSumExp(alpha,x,err) result(LSE)
 
   ! use quadruple precision variables to prevent over/underflow
   alpha_qp = real(alpha,real128)
-  allocate(x_qp(size(x)))
-  x_qp     = real(x,real128)
+  x1_qp    = real(x1,real128)
+  x2_qp    = real(x2,real128)
 
   ! shift value to improve numerical stability
-  x_star = maxval(abs(x_qp))
+  x_star = max(abs(x1_qp),abs(x2_qp))
 
-  LSE_qp= x_star + log(sum(exp(alpha_qp*(x_qp-x_star))))/alpha_qp
+  LSE_qp= x_star + log(exp(alpha_qp*(x1_qp-x_star)) + exp(alpha_qp*(x2_qp-x_star)))/alpha_qp
   LSE=real(LSE_qp,rkind)
   
   ! check if value is normal (not NaN, -Infinity, or +Infinity)
@@ -718,9 +793,9 @@ function LogSumExp(alpha,x,err) result(LSE)
     return
   else                          ! revert to analytic max/min function as a failsafe (accurate but not smoothed)
     if (alpha < 0._rkind) then  ! min
-      LSE = minval(x)
+      LSE = min(x1,x2)
     else                        ! max (alpha cannot be zero)
-      LSE = maxval(x)
+      LSE = max(x1,x2)
     end if
   end if
 
@@ -728,49 +803,196 @@ end function LogSumExp
 
 
 ! ******************************************************************************************************************************
-! public function SoftArgMax: SoftArgMax (aliases: softmax, normalized exponential) function for smooth approximations to argument max or min
+! public function SoftArgMax: SoftArgMax (aliases: softmax, normalized exponential) weight on x1 of two values, a smooth argument max or min
 ! ******************************************************************************************************************************
 ! Note: Can be used to evaluate the derivatives of LogSumExp
-! dLogSumExp(alpha,x)_dx(i) = SoftArgMax(alpha,x)
-function SoftArgMax(alpha,x) result(SAM)
+! dLogSumExp(alpha,x1,x2)_dx1 = SoftArgMax(alpha,x1,x2)
+function SoftArgMax(alpha,x1,x2) result(SAM)
   use, intrinsic :: ieee_arithmetic,only:ieee_is_normal
   use, intrinsic :: iso_fortran_env,only:real128
   implicit none
   ! input
   real(rkind),intent(in) :: alpha ! smoothness parameter (SAM --> arg max as alpha --> +Inf, SAM --> arg min as alpha --> -Inf)
-  real(rkind),intent(in) :: x(:) ! vector of input values
+  real(rkind),intent(in) :: x1,x2 ! input values
   ! output
-  real(rkind),allocatable  :: SAM(:) ! SoftArgMax value 
+  real(rkind)            :: SAM   ! SoftArgMax weight on x1
   ! local variables
   real(real128) :: alpha_qp ! quadruple precision alpha
   real(real128) :: x_star   ! quadruple precision shift value for numerical stability
-  real(real128),allocatable :: x_qp(:)   ! quadruple precision x vector
-  real(real128),allocatable :: SAM_qp(:) ! quadruple precision SAM value 
+  real(real128) :: e1,e2    ! quadruple precision shifted exponentials of x1 and x2
 
   ! use quadruple precision variables to prevent over/underflow
   alpha_qp = real(alpha,real128)
-  allocate(x_qp(size(x)))
-  x_qp     = real(x,real128)
 
   ! shift value to improve numerical stability
-  x_star = maxval(abs(x_qp))
+  x_star = max(abs(real(x1,real128)),abs(real(x2,real128)))
 
-  allocate(SAM_qp(size(x)))
-  SAM_qp = exp(alpha_qp*(x_qp-x_star)) / sum(exp(alpha_qp*(x_qp-x_star)))
-  SAM = real(SAM_qp,rkind)
+  e1 = exp(alpha_qp*(real(x1,real128)-x_star))
+  e2 = exp(alpha_qp*(real(x2,real128)-x_star))
+  SAM = real(e1/(e1+e2),rkind)
 
-  ! check if all values are normal (not NaN, -Infinity, or +Infinity)
+  ! check if both weights are normal (not NaN, -Infinity, or +Infinity)
   ! note: mainly to account for overflow/underflow that may occur in extreme cases
-  if (all(ieee_is_normal(SAM))) then ! return if value is not NaN or infinity
+  if (ieee_is_normal(SAM) .and. ieee_is_normal(real(e2/(e1+e2),rkind))) then ! return if values are not NaN or infinity
     return
   else                          ! revert to analytic arg max/min function in one-hot representation as a failsafe (accurate but not smoothed)
-    SAM(:) = 0._rkind
-    if (alpha < 0._rkind) then  ! arg min
-      SAM(minloc(x)) = 1._rkind
-    else                        ! arg max
-      SAM(maxloc(x)) = 1._rkind 
+    if (alpha < 0._rkind) then  ! arg min (first on a tie)
+      SAM = merge(1._rkind, 0._rkind, x1 <= x2)
+    else                        ! arg max (first on a tie)
+      SAM = merge(1._rkind, 0._rkind, x1 >= x2)
     end if
   end if
 end function SoftArgMax
+
+! ******************************************************************************************************************************
+! public functions smoothHead, dSmoothHead_dPsi, d2SmoothHead_dPsi2: smooth min(psi,0) of total matric head psi (m), and its first (-)
+! and second (m-1) derivatives; quadratic for |psi| < psiSmooth, exactly psi below and 0 above, so total water is theta_sat at psi >= psiSmooth
+! ******************************************************************************************************************************
+function smoothHead(psi)
+  implicit none
+  real(rkind),intent(in) :: psi        ! total matric head (m)
+  real(rkind)            :: smoothHead ! smooth min(psi,0) (m)
+  if(psi <= -psiSmooth)then
+    smoothHead = psi
+  elseif(psi >= psiSmooth)then
+    smoothHead = 0._rkind
+  else
+    smoothHead = -0.25_rkind*(psi - psiSmooth)**2_i4b/psiSmooth
+  end if
+end function smoothHead
+
+function dSmoothHead_dPsi(psi)
+  implicit none
+  real(rkind),intent(in) :: psi              ! total matric head (m)
+  real(rkind)            :: dSmoothHead_dPsi ! derivative of smoothHead (-)
+  if(psi <= -psiSmooth)then
+    dSmoothHead_dPsi = 1._rkind
+  elseif(psi >= psiSmooth)then
+    dSmoothHead_dPsi = 0._rkind
+  else
+    dSmoothHead_dPsi = 0.5_rkind*(psiSmooth - psi)/psiSmooth
+  end if
+end function dSmoothHead_dPsi
+
+function d2SmoothHead_dPsi2(psi)
+  implicit none
+  real(rkind),intent(in) :: psi                ! total matric head (m)
+  real(rkind)            :: d2SmoothHead_dPsi2 ! second derivative of smoothHead (m-1)
+  d2SmoothHead_dPsi2 = 0._rkind
+  if(abs(psi) < psiSmooth) d2SmoothHead_dPsi2 = -0.5_rkind/psiSmooth
+end function d2SmoothHead_dPsi2
+
+! ******************************************************************************************************************************
+! public functions volFracTot, dVolFracTot_dPsi, matricHeadTot: total water content (-) as a function of total matric head (m),
+! its derivative (m-1), and its inverse; the van Genuchten curve evaluated at smoothHead(psi)
+! ******************************************************************************************************************************
+function volFracTot(psi,alpha,theta_res,theta_sat,n,m)
+  implicit none
+  real(rkind),intent(in) :: psi,alpha,theta_res,theta_sat,n,m ! total matric head (m) and van Genuchten parameters
+  real(rkind)            :: volFracTot                        ! volumetric fraction of total water (-)
+  volFracTot = volFracLiq(smoothHead(psi),alpha,theta_res,theta_sat,n,m)
+end function volFracTot
+
+function dVolFracTot_dPsi(psi,alpha,theta_res,theta_sat,n,m)
+  implicit none
+  real(rkind),intent(in) :: psi,alpha,theta_res,theta_sat,n,m ! total matric head (m) and van Genuchten parameters
+  real(rkind)            :: dVolFracTot_dPsi                  ! derivative of total water w.r.t. total matric head (m-1)
+  dVolFracTot_dPsi = max(epsilon(psi), dTheta_dPsi(smoothHead(psi),alpha,theta_res,theta_sat,n,m)*dSmoothHead_dPsi(psi)) ! floor avoids division by zero
+end function dVolFracTot_dPsi
+
+function matricHeadTot(theta,alpha,theta_res,theta_sat,n,m)
+  implicit none
+  real(rkind),intent(in) :: theta,alpha,theta_res,theta_sat,n,m ! total water content (-) and van Genuchten parameters
+  real(rkind)            :: matricHeadTot                       ! total matric head (m), psiSmooth at or above theta_sat
+  real(rkind)            :: psiS                                ! smoothed head on the van Genuchten curve (m)
+  psiS = matricHead(theta,alpha,theta_res,theta_sat,n,m)
+  matricHeadTot = unsmoothHead(psiS)
+end function matricHeadTot
+
+! ******************************************************************************************************************************
+! public functions unsmoothHead, dUnsmoothHead_dPsi: inverse of smoothHead (m), psiSmooth for a smoothed head psiS >= 0, and its derivative (-)
+! ******************************************************************************************************************************
+function unsmoothHead(psiS)
+  implicit none
+  real(rkind),intent(in) :: psiS         ! smoothed head on the van Genuchten curve (m)
+  real(rkind)            :: unsmoothHead ! head whose smoothHead is psiS (m)
+  if(psiS <= -psiSmooth)then
+    unsmoothHead = psiS
+  elseif(psiS >= 0._rkind)then
+    unsmoothHead = psiSmooth
+  else
+    unsmoothHead = psiSmooth - 2._rkind*sqrt(-psiSmooth*psiS)
+  end if
+end function unsmoothHead
+
+function dUnsmoothHead_dPsi(psiS)
+  implicit none
+  real(rkind),intent(in) :: psiS               ! smoothed head on the van Genuchten curve (m)
+  real(rkind)            :: dUnsmoothHead_dPsi ! derivative of unsmoothHead (-)
+  if(psiS <= -psiSmooth)then
+    dUnsmoothHead_dPsi = 1._rkind
+  elseif(psiS >= 0._rkind)then
+    dUnsmoothHead_dPsi = 0._rkind
+  else
+    dUnsmoothHead_dPsi = sqrt(-psiSmooth/psiS)
+  end if
+end function dUnsmoothHead_dPsi
+
+! ******************************************************************************************************************************
+! public function dPsiLiqFrozen_dPsi0: derivative (-) of the frozen-soil liquid head w.r.t. the total head at fixed liquid water,
+! below psiSmooth; psiS and psiSL are the smoothed total and liquid heads (m), xNum = volFracLiq - theta_res, xDen = xNum + deficit (-);
+! the retention slopes enter as a ratio so it stays finite as psiS, psiSL -> 0
+! ******************************************************************************************************************************
+function dPsiLiqFrozen_dPsi0(psiS,psiSL,xNum,xDen,alpha,theta_res,theta_sat,n,m)
+  implicit none
+  real(rkind),intent(in) :: psiS,psiSL                    ! smoothed total and liquid heads on the van Genuchten curve (m)
+  real(rkind),intent(in) :: xNum,xDen                     ! liquid water above residual, and its value at total saturation (-)
+  real(rkind),intent(in) :: alpha,theta_res,theta_sat,n,m ! van Genuchten parameters
+  real(rkind)            :: dPsiLiqFrozen_dPsi0           ! derivative of the liquid head w.r.t. the total head (-)
+  dPsiLiqFrozen_dPsi0 = 0._rkind
+  if(psiS >= 0._rkind .or. psiSL >= 0._rkind .or. xNum <= 0._rkind) return
+  dPsiLiqFrozen_dPsi0 = sqrt(min(-psiS,psiSmooth)/min(-psiSL,psiSmooth))*(theta_sat - theta_res)*xNum/xDen**2_i4b &  ! dSmoothHead_dPsi*dUnsmoothHead_dPsi
+                        *(psiS/psiSL)**(n - 1._rkind)*((1._rkind + (alpha*psiS)**n)/(1._rkind + (alpha*psiSL)**n))**(-m - 1._rkind)
+end function dPsiLiqFrozen_dPsi0
+
+! ******************************************************************************************************************************
+! public function satDeficit: theta_sat minus the total water content (-) at a matric head psi <= 0 (m), accurate as psi -> 0
+! ******************************************************************************************************************************
+function satDeficit(psi,alpha,theta_sat,theta_res,n,m)
+  implicit none
+  real(rkind),intent(in) :: psi,alpha,theta_sat,theta_res,n,m ! matric head (m) and van Genuchten parameters
+  real(rkind)            :: satDeficit                       ! theta_sat - volFracLiq(psi) (-)
+  satDeficit = -(theta_sat - theta_res)*expm1Acc(-m*log1pAcc((psi*alpha)**n))
+end function satDeficit
+
+! ******************************************************************************************************************************
+! public functions log1pAcc and expm1Acc: log(1+x) and exp(x)-1 accurate for small x (Kahan's forms)
+! ******************************************************************************************************************************
+function log1pAcc(x)
+  implicit none
+  real(rkind),intent(in) :: x
+  real(rkind)            :: log1pAcc,u
+  u = 1._rkind + x
+  if(u == 1._rkind)then
+    log1pAcc = x
+  else
+    log1pAcc = log(u)*x/(u - 1._rkind)
+  endif
+end function log1pAcc
+
+function expm1Acc(x)
+  implicit none
+  real(rkind),intent(in) :: x
+  real(rkind)            :: expm1Acc,u
+  u = exp(x)
+  if(u == 1._rkind)then
+    expm1Acc = x
+  else if(u - 1._rkind == -1._rkind)then
+    expm1Acc = -1._rkind
+  else
+    expm1Acc = (u - 1._rkind)*x/log(u)
+  endif
+end function expm1Acc
+
 
 end module soil_utils_module

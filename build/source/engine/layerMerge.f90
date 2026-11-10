@@ -49,6 +49,7 @@ USE multiconst,only:&
 USE data_types,only:&
                     var_ilength,      & ! data vector with variable length dimension (i4b)
                     var_dlength,      & ! data vector with variable length dimension (rkind)
+                    zLookup,          & ! lookup tables
                     model_options       ! defines the model decisions
 
 ! access named variables defining elements in the data structures
@@ -67,6 +68,7 @@ USE var_derive_module,only:calcHeight ! module to calculate height at layer inte
 implicit none
 private
 public::layerMerge
+public::rmLyAllVars
 
 contains
 
@@ -80,6 +82,7 @@ contains
                        tooMuchMelt,                 & ! intent(in):    flag to force merge of snow layers
                        model_decisions,             & ! intent(in):    model decisions
                        mpar_data,                   & ! intent(in):    model parameters
+                       lookup_data,                 & ! intent(in):    lookup tables
                        indx_data,                   & ! intent(inout): type of each layer
                        prog_data,                   & ! intent(inout): model prognostic variables for a local HRU
                        diag_data,                   & ! intent(inout): model diagnostic variables for a local HRU
@@ -96,6 +99,7 @@ contains
  logical(lgt),intent(in)          :: tooMuchMelt         ! flag to denote that ice is insufficient to support melt
  type(model_options),intent(in)   :: model_decisions(:)  ! model decisions
  type(var_dlength),intent(in)     :: mpar_data           ! model parameters
+ type(zLookup),intent(in)         :: lookup_data         ! lookup tables
  type(var_ilength),intent(inout)  :: indx_data           ! type of each layer
  type(var_dlength),intent(inout)  :: prog_data           ! model prognostic variables for a local HRU
  type(var_dlength),intent(inout)  :: diag_data           ! model diagnostic variables for a local HRU
@@ -262,7 +266,7 @@ contains
       ! identify the layer closest to the surface
       kLayer=min(iLayer,jLayer)
       ! combine layer with identified neighbor
-      call layer_combine(doGlac,mpar_data,prog_data,diag_data,flux_data,indx_data,kLayer,err,cmessage)
+      call layer_combine(doGlac,mpar_data,lookup_data,prog_data,diag_data,flux_data,indx_data,kLayer,err,cmessage)
       if(err/=0)then; err=10; message=trim(message)//trim(cmessage); return; end if
 
       ! update the number of snow layers
@@ -294,7 +298,7 @@ contains
    ! initial check to ensure everything is wonderful in the universe
    if(nSnow /= maxLayers+1)then; err=5; message=trim(message)//'special case of >maxLayers layers: expect only one more'; return; end if
    ! combine maxLayers-th layer with layer below
-   call layer_combine(doGlac,mpar_data,prog_data,diag_data,flux_data,indx_data,maxLayers,err,cmessage)
+   call layer_combine(doGlac,mpar_data,lookup_data,prog_data,diag_data,flux_data,indx_data,maxLayers,err,cmessage)
    ! update the number of snow layers
    nSnow   = indx_data%var(iLookINDEX%nSnow)%dat(1)
    nLayers = indx_data%var(iLookINDEX%nLayers)%dat(1)
@@ -335,7 +339,7 @@ contains
  ! ***********************************************************************************************************
  ! combines layer iLayer with iLayer+1
  ! ***********************************************************************************************************
- subroutine layer_combine(doGlac,mpar_data,prog_data,diag_data,flux_data,indx_data,iLayer,err,message)
+ subroutine layer_combine(doGlac,mpar_data,lookup_data,prog_data,diag_data,flux_data,indx_data,iLayer,err,message)
  ! provide access to variables in the data structures
  USE var_lookup,only:iLookPARAM,iLookPROG,iLookINDEX              ! named variables for structure elements
  USE globalData,only:prog_meta,diag_meta,flux_meta,indx_meta      ! metadata
@@ -348,6 +352,7 @@ contains
  ! input/output: data structures
  logical(lgt),intent(in)         :: doGlac    ! flag to denote that merging glacier ice
  type(var_dlength),intent(in)    :: mpar_data ! model parameters
+ type(zLookup),intent(in)        :: lookup_data ! lookup tables (snow/ice temperature-enthalpy tables)
  type(var_dlength),intent(inout) :: prog_data ! model prognostic variables for a local HRU
  type(var_dlength),intent(inout) :: diag_data ! model diagnostic variables for a local HRU
  type(var_dlength),intent(inout) :: flux_data ! model flux variables
@@ -423,7 +428,8 @@ contains
  cEnthalpy = (depth(iLayer)*l1Enthalpy + depth(iLayer+1)*l2Enthalpy)/cDepth
 
  ! convert enthalpy (J m-3) to temperature (K)
- call enthalpy2T_snLaGlWat(cEnthalpy,cBulkDenWat,frz_scale_use,cTemp,.not.doGlac,err,cmessage)
+ if(.not.associated(lookup_data%snow))then; err=20; message=trim(message)//'snow/ice lookup tables have not been built'; return; end if
+ call enthalpy2T_snLaGlWat(cEnthalpy,cBulkDenWat,frz_scale_use,cTemp,.not.doGlac,lookup_data%snow,err,cmessage)
  if(err/=0)then; err=10; message=trim(message)//trim(cmessage); return; end if
 
  ! test enthalpy conversion
@@ -445,10 +451,7 @@ contains
  cVolFracLiq =          fLiq *cBulkDenWat/iden_water
  cVolFracIce = (1._rkind - fLiq)*cBulkDenWat/iden_ice
 
- ! glacier ice: keep the ice and liquid water as they are, with the temperature that conserves the sensible heat (exact for
- ! a fixed composition). The liquid in melting ice is held at its residual content by drainage, and the ice freezing curve
- ! is so steep there that the liquid re-derived above from the merged temperature turns the temperature tolerance of the
- ! solver into a change of ice and liquid at every merge (the enthalpy conversion above is kept for its checks).
+ ! glacier ice: keep the ice and liquid as they are, at the temperature that conserves the sensible heat
  if(doGlac)then
   do k=1,2
     heatCap(k) = Cp_ice*massIce(k) + Cp_water*massLiq(k)
@@ -521,7 +524,7 @@ contains
 
 
  ! ***********************************************************************************************************
- ! private subroutine rmLyAllVars: reduce the length of the vectors in data structures
+ ! public subroutine rmLyAllVars: reduce the length of the vectors in data structures
  ! ***********************************************************************************************************
  ! removes layer "iLayer+1" and sets layer "iLayer" to a missing value
  ! (layer "iLayer" will be filled with a combined layer later)

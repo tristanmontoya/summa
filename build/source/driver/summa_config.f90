@@ -4,8 +4,24 @@ use build_options, only: mizuroute_active
 
 USE nr_type
 USE summa_type, only: config_info       ! summa configuation info
+USE data_types, only: calib_info        ! calibration info
+USE data_types, only: obs_fileinfo      ! obs file info
+
 USE globalData, only: iulog             ! I/O unit for logging messages
-USE globalData, only: iRunMode, iRunModeFull
+USE globalData, only: startGRU          ! index of the first GRU of the run domain
+USE globalData, only: integerMissing    ! missing integer
+
+USE calibration_config, only: parse_word_list
+USE calibration_config, only: parse_nsga2_settings
+USE calibration_config, only: parse_calibration_targets
+USE calibration_config, only: parse_calibration_parameters
+USE calibration_config, only: parse_parameter_dependencies
+USE calibration_config, only: parse_calibration_settings
+
+USE calibration_config, only: resolve_parameter_ratio_references
+USE calibration_config, only: finalize_calibration_settings
+
+USE parameter_search,   only: param_spatial_multiplier,param_ratio
 
 #ifdef MIZUROUTE_ACTIVE
 USE mizuroute_config, ONLY: parse_mizuroute_config
@@ -24,29 +40,37 @@ contains
   ! Loads the TOML manifest, extracts the [multi_case] table, and parses the run-level configuration
   ! used to define and distribute independent SUMMA cases.
   ! **************************************************************************************************
-  subroutine read_manifest(manifest_file,config,err,message)
+  subroutine read_manifest(config,err,message)
     USE tomlf_all, only: toml_table,toml_error
     USE tomlf_all, only: toml_load,get_value
     implicit none
   
-    character(*),      intent(in)    :: manifest_file
     type(config_info), intent(inout) :: config
     integer(i4b),      intent(out)   :: err
     character(*),      intent(out)   :: message
     type(toml_table), allocatable :: table
     type(toml_table), pointer     :: subtable
     type(toml_error), allocatable :: toml_err
-    integer(i4b)       :: istat
-    character(len=256) :: cmessage
+    character(len=:), allocatable :: manifest_temp
+    integer(i4b)         :: istat
+    character(len=1024)  :: cmessage
   
     err=0
     message='read_manifest/'
-  
+
+    ! construct the full path to the manifest
+    if(config%manifest_file(1:1) == '/')then
+     manifest_temp = trim(config%manifest_file)
+    else
+     manifest_temp = trim(config%cwd)//'/'//trim(config%manifest_file)
+    endif
+    config%manifest_file = trim(manifest_temp)
+
     ! load the TOML manifest
-    call toml_load(table,trim(manifest_file),error=toml_err)
+    call toml_load(table,trim(config%manifest_file),error=toml_err)
     if(allocated(toml_err))then
       message=trim(message)//"problem loading manifest ['"// &
-              trim(manifest_file)//"']: "//trim(toml_err%message)
+              trim(config%manifest_file)//"']: "//trim(toml_err%message)
       err=20
       return
     endif
@@ -81,14 +105,17 @@ contains
     type(config_info), intent(inout) :: config
     integer(i4b),      intent(out)   :: err
     character(*),      intent(out)   :: message
-    character(len=256) :: cmessage
+    character(len=1024) :: cmessage
   
     err = 0
     message = 'read_summa_config/'
-  
+
     ! load configuration values from the TOML file
     call load_summa_config(config_file, config, err, cmessage)
     if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+
+    ! apply command-line overrides
+    if(allocated(config%home_path_override)) config%home_path = config%home_path_override
 
     ! expand case-specific placeholders
     call expand_summa_config(config,err,cmessage)
@@ -125,13 +152,18 @@ contains
     type(toml_key),          allocatable   :: keys(:)     ! sub-table keys
     type(toml_error),        allocatable   :: error
     ! locals
-    integer(i4b)       :: i,j,k
-    character(len=256) :: cmessage
-    logical(lgt)       :: mizuroute_config_present = .false.
-    logical(lgt)       :: hasObs                      ! .true. if streamflow observations are configured
+    integer(i4b)        :: i,j
+    character(len=1024) :: cmessage
+    logical(lgt)        :: mizuroute_config_present
+    logical(lgt)        :: hasObs                      ! .true. if streamflow observations are configured
 
     err = 0
     message = 'load_summa_config/'
+    mizuroute_config_present=.false.
+
+    ! Reset parameter dependencies when reading a new case
+    config%calib = calib_info()
+    config%obs   = obs_fileinfo()
 
     ! ----- initial checks with early return -----
 
@@ -160,6 +192,9 @@ contains
 
     ! ----- loop through sections -----
     do i = 1, size(sections)
+      
+      nullify(subtable)
+      
       ! ----- load the TOML sub-table for the current section -----
       call get_value(table, trim(sections(i)%key), subtable, requested=.false.)
       if(.not.associated(subtable)) then
@@ -169,30 +204,49 @@ contains
 
       ! ----- parameter dependencies are parsed as a complete section -----
       if(trim(sections(i)%key) == "parameter_dependencies")then
-        call parse_parameter_dependencies(subtable, config, err, cmessage)
+        call parse_parameter_dependencies(subtable,config%calib,err,cmessage)
         if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
         cycle
       endif
 
+      ! ----- parse calibration configuration -----
+      if(trim(sections(i)%key) == 'calibration')then
+
+        ! General calibration settings
+        call parse_calibration_settings(subtable,config%calib,err,cmessage)
+        if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+
+        ! Calibration parameter specifications
+        if(subtable%has_key('parameters')          .or. &
+           subtable%has_key('spatial_multipliers') .or. &
+           subtable%has_key('parameter_ratios'))then
+          call parse_calibration_parameters(subtable,config%calib,err,cmessage)
+          if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+        endif
+
+        ! NSGA-II optimization settings
+        if(subtable%has_key('nsga2'))then
+          call parse_nsga2_settings(subtable,config%calib,err,cmessage)
+          if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+        endif
+
+        ! Calibration targets are parsed after all sections have been read.
+        cycle
+
+      endif
+
       ! ----- get keys for a given section (sub-table) -----
       call subtable%get_keys(keys)
+      if(.not.allocated(keys)) cycle
 
       ! ----- loop through the sub-table -----
       do j = 1, size(keys)
-
-        ! ----- parameter transformations are parsed as a complete sub-table -----
-        if(trim(sections(i)%key) == "calibration" .and. &
-           trim(keys(j)%key)     == "parameter_transformations")then
-          call parse_parameter_transformations(subtable, config, err, cmessage)
-          if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
-          cycle
-        endif
 
         ! select section
         select case (trim(sections(i)%key))
 
           ! ----- parse the summa sections of the TOML table -----
-          case ("simulation", "summa_files", "observations", "calibration")
+          case ("simulation", "summa_files", "observations")
             call parse_summa_config(subtable,              &
                                     trim(sections(i)%key), &
                                     trim(keys(j)%key),     &
@@ -220,11 +274,43 @@ contains
       end do  ! (looping through sub-sections)
     end do  ! (looping through sections)
 
+    ! Resolve calibration parameter dependencies.
+    call resolve_parameter_ratio_references(config%calib,err,cmessage)
+    if(err/=0)then
+      message=trim(message)//trim(cmessage)
+      return
+    endif
+
+    ! -----------------------------------------------------------------------------------------------
+    ! Parse calibration targets after the remaining configuration settings.
+    ! This ensures that observation and calibration defaults are available
+    ! regardless of the order of sections and keys in the TOML file.
+    ! -----------------------------------------------------------------------------------------------
+    nullify(subtable)
+    call get_value(table,'calibration',subtable,requested=.false.)
+
+    if(associated(subtable))then
+      if(subtable%has_key('target'))then
+        call parse_calibration_targets(subtable,config%calib,          &
+                                       config%obs%obs_path,            &
+                                       config%obs%vname_obsflow,err,cmessage)
+        if(err/=0)then
+          message=trim(message)//trim(cmessage)
+          return
+        endif
+      endif
+    endif
+
+    ! Print the completed calibration parameter registry.
+    call print_calibration_parameters(config)
+  
     ! ----- checks -----
     ! Coupled mizuRoute requires the complete set of SUMMA GRUs because runoff from upstream
-    ! GRUs may contribute to river reaches outside the selected SUMMA subdomain.
-    if (config%use_mizuroute .and. iRunMode /= iRunModeFull) then
-      message=trim(message)//'The -g subdomain option cannot be used with coupled mizuRoute because '// &
+    ! GRUs may contribute to river reaches outside the selected SUMMA subdomain.  It is the GRU
+    ! range that says whether the run is the whole domain, not the run mode: a host owning the
+    ! command line runs every GRU of the attributes file, but under iRunModeGRU for the file suffix.
+    if (config%use_mizuroute .and. .not.(startGRU == 1 .and. config%nGRU_user == integerMissing)) then
+      message=trim(message)//'A GRU subdomain cannot be used with coupled mizuRoute because '// &
                              'the selected GRUs may not contain the complete upstream river network.'
       err=20; return
     endif
@@ -246,32 +332,155 @@ contains
       write(iulog,*) '         mizuRoute, hydrofabric, and remapping sections if routing is not required.'
     endif
 
-    ! ----- set default objective function settings -----
+    ! ----- set calibration defaults and derived metric settings -----
 
-    ! NOTE: only when observations are configured. A configuration file is also used for a
-    !       plain run or for mizuRoute alone, and neither has an objective function to
-    !       evaluate, so warning about unset objective settings there is just noise.
+    ! NOTE: warn only when observations are configured. A configuration file is also used for a
+    !       plain run or for mizuRoute alone, and neither has an objective function to evaluate.
     hasObs = .false.
     if(allocated(config%obs%obs_file))then
       if(len_trim(config%obs%obs_file) > 0) hasObs = .true.
     endif
+    if(allocated(config%calib%targets))then
+      if(size(config%calib%targets) > 0) hasObs = .true.
+    endif
 
-    if(hasObs)then
-      ! set default objective-function metric
+    ! ----- finalize generic calibration settings -----
+
+    ! Warn when observations are configured but calibration defaults are used.
+    if(hasObs .and. config%is_case_root)then
+
       if(.not.allocated(config%calib%metric))then
-        config%calib%metric = 'kge'
         write(iulog,*) 'WARNING: objective metric not specified; using kge'
       endif
 
-      ! set default obs transformation
       if(.not.allocated(config%calib%obs_transform))then
-        config%calib%obs_transform = 'none'
         write(iulog,*) 'WARNING: observation transformation not specified; using none'
       endif
+
+    endif
+
+    call finalize_calibration_settings(config%calib,hasObs,err,cmessage)
+    if(err/=0)then
+      message=trim(message)//trim(cmessage)
+      return
+    endif
+
+    ! ----- provide backward compatibility with legacy SUMMA streamflow observations -----
+
+    if(hasObs)then
+
+      call set_default_calibration_target(config,err,cmessage)
+      if(err/=0)then
+        message=trim(message)//trim(cmessage)
+        return
+      endif
+
     endif
 
   end subroutine load_summa_config
   
+  ! **************************************************************************************************
+  ! Print calibration parameter information.
+  ! **************************************************************************************************
+  subroutine print_calibration_parameters(config)
+    USE parameter_search, only: param_physical,param_spatial_multiplier,param_ratio
+    implicit none
+
+    type(config_info), intent(in) :: config
+    integer(i4b) :: i
+    character(len=16) :: lower_text,upper_text
+    character(len=18) :: type_text
+
+    if(.not.config%is_case_root) return
+    if(.not.allocated(config%calib%param_list)) return
+
+    write(iulog,'(/,A)') 'Calibration parameters:'
+    write(iulog,'(5X,A24,2X,A18,2X,A16,2X,A16,2X,A16,2X,A)') &
+      'Parameter','Type','Lower bound','Upper bound','Transformation','Reference'
+
+    do i=1,size(config%calib%param_list)
+
+      associate(param => config%calib%param_list(i))
+
+        ! Parameterization
+        select case(param%param_type)
+        case (param_physical)
+          type_text='physical'
+        case (param_spatial_multiplier)
+          type_text='spatial multiplier'
+        case (param_ratio)
+          type_text='parameter ratio'
+        case default
+          type_text='unknown'
+        end select
+
+        ! Calibration bounds
+        lower_text='native'
+        upper_text='native'
+
+        if(param%has_lower) write(lower_text,'(ES16.8)') param%lower_bound
+        if(param%has_upper) write(upper_text,'(ES16.8)') param%upper_bound
+
+        ! Parameter information
+        write(iulog,'(I3,2X,A24,2X,A18,2X,A16,2X,A16,2X,A16,2X,A)') &
+          i,trim(param%name),trim(type_text),lower_text,upper_text, &
+          trim(param%transformation),trim(param%reference_name)
+
+      end associate
+
+    enddo
+
+  end subroutine print_calibration_parameters
+
+
+  ! **************************************************************************************************
+  ! Express a configuration that names no calibration target as a single-target calibration.
+  !
+  ! The legacy configuration carries one observed streamflow series in [observations] and one metric
+  ! in [calibration].  That is a calibration with exactly one target, so it is stored as one, and the
+  ! objective code needs only the target list.
+  ! **************************************************************************************************
+  subroutine set_default_calibration_target(config, ierr, message)
+    implicit none
+    type(config_info), intent(inout) :: config
+    integer(i4b),      intent(out)   :: ierr
+    character(*),      intent(out)   :: message
+
+    ierr = 0
+    message = 'set_default_calibration_target/'
+
+    ! an explicit target list wins
+    if(allocated(config%calib%targets))then
+      if(size(config%calib%targets) > 0) return
+      deallocate(config%calib%targets)
+    endif
+
+    ! without an observation file there is nothing to build a target from
+    if(.not.allocated(config%obs%obs_file)) return
+    if(len_trim(config%obs%obs_file) == 0) return
+
+    allocate(config%calib%targets(1), stat=ierr)
+    if(ierr/=0)then
+      message=trim(message)//'unable to allocate the default calibration target'
+      return
+    endif
+
+    config%calib%targets(1)%name     = 'streamflow'
+    config%calib%targets(1)%variable = 'streamflow'
+    if(allocated(config%obs%obs_path)) config%calib%targets(1)%obs_path = trim(config%obs%obs_path)
+    config%calib%targets(1)%obs_file = trim(config%obs%obs_file)
+    if(allocated(config%obs%vname_obsflow))then
+      config%calib%targets(1)%vname_obs = trim(config%obs%vname_obsflow)
+    else
+      config%calib%targets(1)%vname_obs = 'q_obs'
+    endif
+    config%calib%targets(1)%metric        = trim(config%calib%metric)
+    config%calib%targets(1)%obs_transform = trim(config%calib%obs_transform)
+    config%calib%targets(1)%boxcox_lambda = config%calib%boxcox_lambda
+    config%calib%targets(1)%weight        = 1.0_rkind
+
+  end subroutine set_default_calibration_target
+
   ! **************************************************************************************************
   ! Parse summa configuration.
   ! **************************************************************************************************
@@ -286,11 +495,12 @@ contains
     integer,                   intent(out)   :: ierr
     character(*),              intent(out)   :: message
     type(toml_array), pointer     :: param_list  ! sub-table for the list of parameters to vary
-    character(len=256)            :: cmessage    ! error message from downwind routine
+    character(len=:), allocatable :: cvalue      ! a string value read into a fixed-length field
+    character(len=1024)           :: cmessage    ! error message from downwind routine
     integer(i4b)                  :: istat       ! error code
+    integer(i4b)                  :: i
 
-    associate(obs   => config%obs, &
-              calib => config%calib)
+    associate(obs   => config%obs)
     
     ierr    = 0
     message = 'parse_summa_config/'
@@ -343,26 +553,6 @@ contains
       ! ---- observations: variable names ----
       case ("observations.vname_obsflow"   ); call get_value(subtable, trim(key), obs%vname_obsflow       , stat=istat)
     
-      ! ---- objective function: metrics  ----
-      case ("calibration.metric"           ); call get_value(subtable, trim(key), calib%metric            , stat=istat)
-      case ("calibration.obs_transform"    ); call get_value(subtable, trim(key), calib%obs_transform     , stat=istat)
-    
-      ! ---- objective function: calibration period  ----
-      case ("calibration.start_date"       ); call get_value(subtable, trim(key), calib%start_date        , stat=istat)
-      case ("calibration.end_date"         ); call get_value(subtable, trim(key), calib%end_date          , stat=istat)
-    
-      ! ---- objective function: list of parameters to modify  ----
-      case ("calibration.param_list"       ); call get_value(subtable, trim(key), param_list              , stat=istat)
-    
-        if(istat == 0)then
-          call parse_word_list(param_list, calib%param_list, ierr, cmessage)
-          if(ierr/=0) then; message=trim(message)//trim(cmessage); return; endif
-        endif   
-
-      ! ---- objective function: flag to write aligned sim/obs time series  ----
-      case ("calibration.n_samples"        ); call get_value(subtable, trim(key), calib%n_samples         , stat=istat)
-      case ("calibration.write_aligned"    ); call get_value(subtable, trim(key), calib%write_aligned     , stat=istat)
-      
       ! ---- default case (something in the table that is not specified above) -----
       case default
         message = trim(message)// "unexpected entry: section = "//trim(section)//"; sub-section = "//trim(key)
@@ -395,11 +585,13 @@ contains
     character(*),              intent(out)   :: message
     type(toml_key), allocatable :: keys(:)
     type(toml_array), pointer   :: case_names
-    integer(i4b)       :: i,istat
-    character(len=256) :: key,cmessage
+    integer(i4b)        :: i,idx,istat
+    character(len=1024) :: key,cmessage
+    logical(lgt)        :: have_template_path
   
     err=0
     message='parse_manifest/'
+    have_template_path = .false.
     call subtable%get_keys(keys)
   
     do i=1,size(keys)
@@ -410,9 +602,12 @@ contains
   
         ! ---- multi-case configuration ----
         case ("multi_case.cases_per_node"   ); call get_value(subtable,trim(keys(i)%key),config%cases_per_node    , stat=istat)
-        
-        ! ----- path/name of toml template -----
+        case ("multi_case.n_runs"           ); call get_value(subtable,trim(keys(i)%key),config%n_runs            , stat=istat)
+        case ("multi_case.experiment"       ); call get_value(subtable,trim(keys(i)%key),config%experiment        , stat=istat)
+
+        ! ----- path/name of toml template (template_path is optional: default is the manifest directory) -----
         case ("multi_case.template_path"    ); call get_value(subtable,trim(keys(i)%key),config%template_path     , stat=istat)
+                                               have_template_path = (istat==0)
         case ("multi_case.template_file"    ); call get_value(subtable,trim(keys(i)%key),config%template_file     , stat=istat)
 
         ! ---- case names ----
@@ -435,12 +630,21 @@ contains
       endif
   
     enddo
- 
-    ! ----- validate required manifest settings -----
-    if(.not.allocated(config%template_path))then
-      message=trim(message)//'template_path is not defined in the multi-case manifest'
-      err=20; return
+
+    ! ----- set the template path (template file assumed to be in the same directory as the manifest) -----
+
+    idx = max( scan(trim(config%manifest_file), '/',       back=.true.), & ! mac/linux
+               scan(trim(config%manifest_file), achar(92), back=.true.)  ) ! windows
+
+    if(.not.have_template_path)then
+      if(idx > 0)then
+        config%template_path = config%manifest_file(:idx)
+      else
+        config%template_path = ''
+      endif
     endif
+
+    ! ----- validate required manifest settings -----
 
     if(.not.allocated(config%template_file))then
       message=trim(message)//'template_file is not defined in the multi-case manifest'
@@ -462,6 +666,11 @@ contains
       err=20; return
     endif
 
+    if(config%n_runs < 1)then
+      message=trim(message)//'n_runs must be greater than zero'
+      err=20; return
+    endif
+
   end subroutine parse_manifest
 
   ! **************************************************************************************************
@@ -475,9 +684,10 @@ contains
     type(config_info), intent(inout) :: config              ! SUMMA configuration information
     integer(i4b),      intent(out)   :: err                 ! error code
     character(*),      intent(out)   :: message             ! error message
-    logical(lgt), parameter :: isPrint=.false.              ! temporary diagnostic output 
+    logical(lgt), parameter :: isPrint=.false.              ! temporary diagnostic output
+    integer(i4b) :: iTarget                                 ! calibration target index
     character(len=256) :: cmessage                          ! message returned by called routines
-  
+
     err=0
     message='expand_summa_config/'
   
@@ -562,6 +772,33 @@ contains
     call expand_config_string(config%forcing_list,config,err,cmessage)
     if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
 
+    ! ---- Common SUMMA configuration files ----
+    call expand_config_string(config%decisions,config,err,cmessage)
+    if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+
+    call expand_config_string(config%output_control,config,err,cmessage)
+    if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+
+    ! ---- Common SUMMA parameter files ----
+    call expand_config_string(config%local_parameters,config,err,cmessage)
+    if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+
+    call expand_config_string(config%basin_parameters,config,err,cmessage)
+    if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+
+    ! ---- Common SUMMA parameter tables ----
+    call expand_config_string(config%vegetation_table,config,err,cmessage)
+    if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+
+    call expand_config_string(config%soil_table,config,err,cmessage)
+    if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+
+    call expand_config_string(config%general_table,config,err,cmessage)
+    if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+
+    call expand_config_string(config%noahmp_table,config,err,cmessage)
+    if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+
 #ifdef MIZUROUTE_ACTIVE
     ! ---- mizuRoute paths ----
     call expand_config_string(config%mizu_info%mrout%namelist_path,config,err,cmessage)
@@ -579,30 +816,45 @@ contains
     ! ---- observation paths and filenames ----
     call expand_config_string(config%obs%obs_path,config,err,cmessage)
     if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
-  
+
     call expand_config_string(config%obs%obs_file,config,err,cmessage)
     if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
-  
+
+    ! ---- per-target observation paths and filenames ----
+    ! A target names its own observation file, so it needs the same placeholder expansion the
+    ! [observations] section gets; a multi-case run relies on it to reach each case's own data.
+    if(allocated(config%calib%targets))then
+      do iTarget=1,size(config%calib%targets)
+        call expand_config_string(config%calib%targets(iTarget)%obs_path,config,err,cmessage)
+        if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+
+        call expand_config_string(config%calib%targets(iTarget)%obs_file,config,err,cmessage)
+        if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+      enddo
+    endif
+
     ! temporary diagnostic output
     if(isPrint)then
       write(*,'(A)') 'Expanded SUMMA configuration:'
-      write(*,'(A)') '  case_name     = '//trim(config%case_name)
-      write(*,'(A)') '  basin_dir     = '//trim(config%basin_dir)
-      write(*,'(A)') '  settings_path = '//trim(config%settings_path)
-      write(*,'(A)') '  forcing_path  = '//trim(config%forcing_path)
-      write(*,'(A)') '  output_path   = '//trim(config%output_path)
-      write(*,'(A)') '  state_path    = '//trim(config%state_path)
+      write(*,'(A)') '  case_name      = '//trim(config%case_name)
+      write(*,'(A)') '  basin_dir      = '//trim(config%basin_dir)
+      write(*,'(A)') '  settings_path  = '//trim(config%settings_path)
+      write(*,'(A)') '  forcing_path   = '//trim(config%forcing_path)
+      write(*,'(A)') '  output_path    = '//trim(config%output_path)
+      write(*,'(A)') '  state_path     = '//trim(config%state_path)
       write(*,'(A)') '  init_condition = '//trim(config%init_condition)
       write(*,'(A)') '  attributes     = '//trim(config%attributes)
       write(*,'(A)') '  trial_params   = '//trim(config%trial_params)
       write(*,'(A)') '  forcing_list   = '//trim(config%forcing_list)
+      write(*,'(A)') '  decisions      = '//trim(config%decisions)
+      write(*,'(A)') '  local_params   = '//trim(config%local_parameters)
 #ifdef MIZUROUTE_ACTIVE
-      write(*,'(A)') '  namelist_path = '//trim(config%mizu_info%mrout%namelist_path)
-      write(*,'(A)') '  hfabric_path  = '//trim(config%mizu_info%ntopo%hfabric_path)
-      write(*,'(A)') '  remap_path    = '//trim(config%mizu_info%remap%remap_path)
+      write(*,'(A)') '  namelist_path  = '//trim(config%mizu_info%mrout%namelist_path)
+      write(*,'(A)') '  hfabric_path   = '//trim(config%mizu_info%ntopo%hfabric_path)
+      write(*,'(A)') '  remap_path     = '//trim(config%mizu_info%remap%remap_path)
 #endif
-      write(*,'(A)') '  obs_path      = '//trim(config%obs%obs_path)
-      write(*,'(A)') '  obs_file      = '//trim(config%obs%obs_file)
+      write(*,'(A)') '  obs_path       = '//trim(config%obs%obs_path)
+      write(*,'(A)') '  obs_file       = '//trim(config%obs%obs_file)
       write(*,*)
     endif
 
@@ -677,220 +929,9 @@ contains
   end subroutine apply_summa_config
 
   ! --------------------------------------------------------------------------------------------------
-  ! ---- PARSERS -------------------------------------------------------------------------------------
-  ! **************************************************************************************************
-  ! Parse a TOML array containing a list of words.
-  ! **************************************************************************************************
-  subroutine parse_word_list(word_list, words, ierr, message)
-    use tomlf_all, only: toml_array, get_value, len
-    implicit none
-  
-    type(toml_array), pointer, intent(in)          :: word_list
-    character(len=*), allocatable, intent(out)     :: words(:)
-    integer(i4b), intent(out)                      :: ierr
-    character(*), intent(out)                      :: message
-    integer(i4b)                  :: i
-    integer(i4b)                  :: nwords
-    character(len=:), allocatable :: word
-  
-    ierr = 0
-    message = 'parse_word_list/'
-  
-    ! check that the TOML array exists
-    if(.not.associated(word_list))then
-      if(allocated(words)) deallocate(words)
-      allocate(words(0))
-      return
-    endif
-    nwords = len(word_list)
-  
-    ! NOTE: as elsewhere, a multi-case run reuses one config, so the caller's array may
-    !       still hold the previous case's words
-    if(allocated(words)) deallocate(words)
-
-    ! allocate output array
-    allocate(words(nwords), stat=ierr)
-    if(ierr/=0)then
-      message=trim(message)//'unable to allocate word list'
-      return
-    endif
-  
-    ! populate output array
-    do i=1,nwords
-      call get_value(word_list, i, word, stat=ierr)
-      if(ierr/=0)then
-        write(message,'(A,I0)') trim(message)//'unable to read word, i = ',i
-        return
-      endif
-  
-      ! prevent silent truncation
-      if(len_trim(word) > len(words))then
-        write(message,'(A,I0,A,I0)') trim(message)// &
-          'word exceeds maximum character length, i = ', i, ', maximum length = ', len(words)
-        ierr=20; return
-      endif
-      words(i) = trim(word)
-  
-    enddo
-  
-  end subroutine parse_word_list
-
-
-  ! **************************************************************************************************
-  ! Parse parameter transformations.
-  ! Reads parameter transformations from a TOML key-value table where each key is a parameter name
-  ! and each value defines the transformation used for that parameter during parameter search.
-  ! **************************************************************************************************
-  subroutine parse_parameter_transformations(calib_table, config, ierr, message)
-    use tomlf_all, only: toml_table, toml_key, get_value
-    implicit none
-  
-    type(toml_table), pointer, intent(in)    :: calib_table
-    type(config_info),         intent(inout) :: config
-    integer(i4b),              intent(out)   :: ierr
-    character(*),              intent(out)   :: message
-    type(toml_table), pointer    :: transform_table
-    type(toml_key), allocatable  :: keys(:)
-    integer(i4b) :: i
-    integer(i4b) :: istat
-    character(len=:), allocatable :: transform
-  
-    ierr = 0
-    message = 'parse_parameter_transformations/'
-  
-    ! get parameter transformation sub-table
-    call get_value(calib_table, 'parameter_transformations', &
-                   transform_table, stat=istat)
-    if(istat/=0 .or. .not.associated(transform_table))then
-      message=trim(message)//'unable to read parameter_transformations table'
-      ierr=20; return
-    endif
-  
-    ! NOTE: a multi-case run reuses one config structure for every case, so this may still
-    !       hold the previous case's transformations. Release them before reallocating.
-    if(allocated(config%calib%param_transform)) deallocate(config%calib%param_transform)
-
-    ! get parameter names from table keys
-    call transform_table%get_keys(keys)
-    if(.not.allocated(keys))then
-      allocate(config%calib%param_transform(0))
-      return
-    endif
-  
-    ! allocate transformation information
-    allocate(config%calib%param_transform(size(keys)),stat=ierr)
-    if(ierr/=0)then
-      message=trim(message)//'unable to allocate parameter transformations'
-      return
-    endif
-  
-    ! read parameter -> transformation mappings
-    do i=1,size(keys)
-      ! check parameter-name length
-      if(len_trim(keys(i)%key) > len(config%calib%param_transform(i)%name))then
-        write(message,'(A,I0)') trim(message)// &
-          'parameter name exceeds maximum character length, i = ',i
-        ierr=20; return
-      endif
-      config%calib%param_transform(i)%name = trim(keys(i)%key)
-      call get_value(transform_table,trim(keys(i)%key),transform,stat=istat)
-      if(istat/=0)then
-        message=trim(message)//'unable to read transformation for parameter: '// &
-                trim(keys(i)%key)
-        ierr=20; return
-      endif
-  
-      ! check transformation-name length
-      if(len_trim(transform) > len(config%calib%param_transform(i)%transformation))then
-        message=trim(message)//'transformation name exceeds maximum character length for parameter: '// &
-                trim(keys(i)%key)
-        ierr=20; return
-      endif
-      config%calib%param_transform(i)%transformation = trim(transform)
-    enddo
-  
-  end subroutine parse_parameter_transformations
-
-  ! **************************************************************************************************
-  ! Parse parameter dependency configuration.
-  ! Reads ordered parameter constraints from the TOML configuration. Each constraint defines
-  ! an ordered list of parameters and the minimum gap between adjacent parameters as a fraction
-  ! of the total parameter range.
-  ! **************************************************************************************************
-  subroutine parse_parameter_dependencies(subtable, config, ierr, message)
-    use tomlf_all, only: toml_table, toml_array, get_value, len
-    implicit none
-  
-    type(toml_table), pointer, intent(in)    :: subtable
-    type(config_info),         intent(inout) :: config
-    integer(i4b),              intent(out)   :: ierr
-    character(*),              intent(out)   :: message
-    type(toml_array), pointer :: ordered
-    type(toml_table), pointer :: constraint
-    type(toml_array), pointer :: param_list
-    integer(i4b) :: i
-    integer(i4b) :: istat
-    integer(i4b) :: nconstraints
-    character(len=256) :: cmessage
-  
-    ierr = 0
-    message = 'parse_parameter_dependencies/'
-  
-    ! get array of ordered constraints
-    call get_value(subtable, 'ordered', ordered, requested=.false., stat=istat)
-    if(.not.associated(ordered)) return
-    nconstraints = len(ordered)
-  
-    ! allocate constraint structures
-    ! as above: the previous case's constraints may still be allocated
-    if(allocated(config%calib%ordered)) deallocate(config%calib%ordered)
-
-    allocate(config%calib%ordered(nconstraints), stat=ierr)
-    if(ierr/=0)then
-      message=trim(message)//'unable to allocate ordered parameter constraints'
-      return
-    endif
-  
-    ! parse each ordered constraint
-    do i=1,nconstraints
-  
-      call get_value(ordered, i, constraint, stat=istat)
-      if(istat/=0 .or. .not.associated(constraint))then
-        write(message,'(A,I0)') trim(message)// &
-          'unable to read ordered constraint, i = ',i
-        ierr=20; return
-      endif
-  
-      ! parameter list
-      call get_value(constraint, 'parameters', param_list, stat=istat)
-      if(istat/=0 .or. .not.associated(param_list))then
-        write(message,'(A,I0)') trim(message)// &
-          'parameter list not defined for ordered constraint, i = ',i
-        ierr=20; return
-      endif
-  
-      call parse_word_list(param_list,                         &
-                           config%calib%ordered(i)%parameters, &
-                           ierr,cmessage)
-      if(ierr/=0)then
-        message=trim(message)//trim(cmessage)
-        return
-      endif
-  
-      ! gap fraction
-      call get_value(constraint, 'gap_fraction', &
-                     config%calib%ordered(i)%gap_fraction, stat=istat)
-      if(istat/=0)then
-        write(message,'(A,I0)') trim(message)// &
-          'gap_fraction not defined for ordered constraint, i = ',i
-        ierr=20; return
-      endif
-    enddo
-  
-  end subroutine parse_parameter_dependencies
-
-  ! --------------------------------------------------------------------------------------------------
   ! ---- HELPERS -------------------------------------------------------------------------------------
+  ! --------------------------------------------------------------------------------------------------
+
   ! **************************************************************************************************
   ! Expand supported placeholders in a configuration string.
   ! Replaces case-specific template variables with their resolved values. Unallocated configuration
@@ -903,7 +944,7 @@ contains
     type(config_info),              intent(in)    :: config  ! SUMMA configuration information
     integer(i4b),                   intent(out)   :: err     ! error code
     character(*),                   intent(out)   :: message ! error message
-    character(len=256)                            :: cmessage
+    character(len=1024)                           :: cmessage
 
     err=0
     message='expand_config_string/'
@@ -950,7 +991,17 @@ contains
       call replace_string(value,'{work_path}',trim(config%work_path),err,cmessage)
       if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
     endif
-  
+ 
+    ! expand the experiment identifier.
+    if(index(value,'{experiment}')>0)then
+      if(.not.allocated(config%experiment))then
+        message=trim(message)//"placeholder '{experiment}' used but experiment is not defined"
+        err=20; return
+      endif
+      call replace_string(value,'{experiment}',trim(config%experiment),err,cmessage)
+      if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+    endif
+
   end subroutine expand_config_string
 
   ! **************************************************************************************************

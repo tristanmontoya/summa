@@ -35,9 +35,8 @@ USE data_types,only:&
                var_d,                    & ! x%var(:)                (rkind)
                var_dlength                 ! x%var(:)%dat            (rkind)
 
-! access vegetation data
-USE globalData,only:greenVegFrac_monthly   ! fraction of green vegetation in each month (0-1)
-USE globalData,only:overwriteRSMIN         ! flag to overwrite RSMIN
+! named variables
+USE globalData,only:solver_error           ! named variable for a solver error
 
 ! access domain types
 USE globalData,only:upland                 ! horizontal domain type for upland areas
@@ -62,29 +61,10 @@ USE var_lookup,only:iLookPROG              ! look-up values for local column mod
 USE var_lookup,only:iLookDIAG              ! look-up values for local column model diagnostic variables
 USE var_lookup,only:iLookINDEX             ! look-up values for local column index variables
 
-! provide access to model decisions
-USE globalData,only:model_decisions        ! model decision structure
-USE var_lookup,only:iLookDECISIONS         ! look-up values for model decisions
-
 ! these are needed because we cannot access them in modules locally if we might use those modules with Actors
 USE globalData,only:fracJulDay             ! fractional julian days since the start of year
 USE globalData,only:yearLength             ! number of days in the current year
 USE globalData,only:tmZoneOffsetFracDay    ! time zone offset in fractional days
-
-! provide access to the named variables that describe model decisions
-USE mDecisions_module,only:        &       ! look-up values for LAI decisions
-                      monthlyTable,&       ! LAI/SAI taken directly from a monthly table for different vegetation classes
-                      specified            ! LAI/SAI computed from green vegetation fraction and winterSAI and summerLAI parameters
-
-! ----- global variables that are modified ------------------------------------------------------------------------------------------
-
-! Noah-MP parameters
-USE NOAHMP_VEG_PARAMETERS,only:SAIM,LAIM   ! 2-d tables for stem area index and leaf area index (vegType,month)
-USE NOAHMP_VEG_PARAMETERS,only:HVT,HVB     ! height at the top and bottom of vegetation (vegType)
-USE noahmp_globals,only:RSMIN              ! minimum stomatal resistance (vegType)
-
-! urban vegetation category (could be local)
-USE globalData,only:urbanVegCategory       ! vegetation category for urban areas
 
 implicit none
 private
@@ -118,7 +98,6 @@ subroutine run_oneHRU(&
                       ! error control
                       err,message)           ! intent(out):   error control
   ! ----- define downstream subroutines -----------------------------------------------------------------------------------
-  USE module_sf_noahmplsm,only:redprm          ! module to assign more Noah-MP parameters
   USE derivforce_module,only:derivforce        ! module to compute derived forcing data
   USE coupled_em_module,only:coupled_em        ! module to run the coupled energy and mass model
   implicit none
@@ -179,27 +158,7 @@ subroutine run_oneHRU(&
     else ! not a water pixel and area of the domain is greater than zero
       if (domInfo(i)%dom_type == upland) then
 
-        ! populate parameters in Noah-MP modules
-        ! Passing an unrealistically large number of soil layers in order to pass the check for NROOT, that is done to avoid making any changes to Noah-MP code.
-        !  --> NROOT from Noah-MP veg tables (as read here) is not used in SUMMA
-        call REDPRM(typeData%var(iLookTYPE%vegTypeIndex),      & ! vegetation type index
-                    typeData%var(iLookTYPE%soilTypeIndex),     & ! soil type
-                    typeData%var(iLookTYPE%slopeTypeIndex),    & ! slope type index
-                    10000_i4b,                                 & ! number of soil layers
-                    urbanVegCategory)                            ! vegetation category for urban areas
-
-        ! overwrite the minimum resistance
-        if(overwriteRSMIN) RSMIN = mparData%dom(i)%var(iLookPARAM%minStomatalResistance)%dat(1)
-        ! overwrite the vegetation height
-        HVT(typeData%var(iLookTYPE%vegTypeIndex)) = mparData%dom(i)%var(iLookPARAM%heightCanopyTop)%dat(1)
-        HVB(typeData%var(iLookTYPE%vegTypeIndex)) = mparData%dom(i)%var(iLookPARAM%heightCanopyBottom)%dat(1)
-
-        ! overwrite the tables for LAI and SAI
-        if(model_decisions(iLookDECISIONS%LAI_method)%iDecision == specified)then
-          SAIM(typeData%var(iLookTYPE%vegTypeIndex),:) = mparData%dom(i)%var(iLookPARAM%winterSAI)%dat(1)
-          LAIM(typeData%var(iLookTYPE%vegTypeIndex),:) = mparData%dom(i)%var(iLookPARAM%summerLAI)%dat(1)*greenVegFrac_monthly
-        end if
-
+        ! NOTE: the Noah-MP parameters for this HRU are assigned where they are used (see noahmpContext)
         use_computeVegFlux = computeVegFlux
 
       elseif ( domInfo(i)%dom_type == glacCln1 .or. domInfo(i)%dom_type == glacCln2 .or. domInfo(i)%dom_type == glacDbr .or. &
@@ -216,6 +175,7 @@ subroutine run_oneHRU(&
       ! compute derived forcing variables, different for each domain type
       call derivforce(&
                       is_glac,              & ! intent(in):    flag to indicate if is a glacier domain
+                      domInfo(i)%dom_type == upland, & ! intent(in): flag to indicate if the domain can have a canopy
                       forcData,             & ! intent(inout): vector of model forcing data
                       attrData,             & ! intent(in):    vector of model attributes
                       mparData%dom(i),      & ! intent(in):    data structure of model parameters
@@ -250,7 +210,12 @@ subroutine run_oneHRU(&
                      fluxData%dom(i),     & ! intent(inout): model fluxes for a local HRU
                      ! error control
                      err,cmessage)          ! intent(out):   error control
-      if(err/=0)then; err=20; message=trim(message)//trim(cmessage); return; endif
+
+      ! enable possibilities to treat numerical solver failures as recoverable
+      if(err/=0)then
+        message=trim(message)//trim(cmessage)
+        err = solver_error; return
+      endif
 
       if(domInfo(i)%dom_type == upland)then
         computeVegFlux = use_computeVegFlux ! update the flag for the next domain on upland areas
