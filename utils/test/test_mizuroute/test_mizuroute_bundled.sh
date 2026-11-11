@@ -14,6 +14,7 @@ set -euo pipefail
 # output is written -- not that the routed flows match any real-world reference.
 #
 # Requires a build configured with -DUSE_MIZUROUTE=ON, and python3 with netCDF4.
+# Usage: ./test_mizuroute_bundled.sh [work_dir] [method]
 # ==============================================================================
 
 # ------------------------------------------------------------------ settings --
@@ -25,6 +26,10 @@ DOMAIN="$SUMMA_ROOT/utils/test/test_ngen/domain_provo"
 FILE_MANAGER="$DOMAIN/settings/SUMMA/fileManager.txt"
 
 WORK_DIR="${1:-$SUMMA_ROOT/utils/test/test_mizuroute/toy_prob}"
+
+# Select routing method from the second argument: default 3 (kinematic wave)
+METHOD="${2:-3}"
+
 SUFFIX="toy_prob"
 
 # the bundled domain covers five years; two months is plenty to exercise routing
@@ -70,7 +75,7 @@ use_mizuroute = true
 namelist_path = "$WORK_DIR/settings/"
 namelist_file = "param.nml.default"
 
-methods = "3"
+methods = "$METHOD"
 
 dt = 3600
 

@@ -189,13 +189,30 @@ CONTAINS
   if(ierr/=0)then; message=trim(message)//trim(cmessage); return; endif
   
   ! TEMPORARY: Copy the data to the old mizuRoute data structures
+  ! Upstream mizuRoute assigns each reach's isLake flag only when lake simulation is
+  ! enabled (is_lake_sim), but its IRF initialization reads that flag even without lakes.
+  ! We hack around this by skipping the upstream IRF block for river-only
+  ! configurations to avoid that read.
+  onRoute(impulseResponseFunc) = is_lake_sim
   call put_data_struct(domain%river_network%core%topology%n_seg,      & 
                        domain%river_network%core%topology%seg,        &
                        domain%river_network%core%topology%ntopo,      &
                        domain%river_network%core%param,               &
                        domain%river_network%core%ntopo,               &
                        ierr, cmessage)
+
   if(ierr/=0)then; message=trim(message)//trim(cmessage); return; endif
+
+  ! For river-only configurations, mark every reach as non-lake and copy the
+  ! already-computed unit hydrographs skipped by disabling the upstream block
+  if (.not. is_lake_sim) then
+    onRoute(impulseResponseFunc) = .true.
+    domain%river_network%core%ntopo(:)%isLake = .false.
+    do iSeg = 1, domain%river_network%core%topology%n_seg
+      domain%river_network%core%ntopo(iSeg)%UH = &
+        domain%river_network%core%topology%seg(iSeg)%var(ixSEG%timeDelayHist)%dat
+    end do
+  endif
   domain%river_network%core%topology%is_initialized = .true.
 
   !---------------------------------------------------------------------
@@ -426,8 +443,9 @@ CONTAINS
       case (kinematicWave);  nMolecule%KW_ROUTE = 20
       case (muskingumCunge); nMolecule%MC_ROUTE = 2
       case (diffusiveWave);  nMolecule%DW_ROUTE = 20
+      case (impulseResponseFunc) ! no computational molecules
       case default
-        message=trim(message)//'routeMethods in restricted to (kinematicWave, muskingumCunge, diffusiveWave)'
+        message=trim(message)//'routeMethods restricted to (impulseResponseFunc, kinematicWave, muskingumCunge, diffusiveWave)'
         ierr=20; return
     end select
   end do
@@ -552,7 +570,11 @@ CONTAINS
            allocate(river_network%core%state(iSeg)%DW_ROUTE%molecule%Q(nMolecule%DW_ROUTE), &
                     source=0._dp, stat=ierr)
          
-         case (accumRunoff, impulseResponseFunc, kinematicWaveTracking)
+         case (impulseResponseFunc)
+           allocate(river_network%core%flux(iSeg)%QFUTURE_IRF( &
+                    size(river_network%core%ntopo(iSeg)%UH)), source=0._dp, stat=ierr)
+
+         case (accumRunoff, kinematicWaveTracking)
            write(message,'(A,I0,A,I0)') trim(message)//'routing method ', routeMethods(idxRoute), &
                                         ' not implemented: use standalone mizuRoute'
            ierr=10; return

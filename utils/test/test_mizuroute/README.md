@@ -53,7 +53,7 @@ real check, not a tautology).
 ## `test_mizuroute_lakes.sh` -- lakes, coupled and standalone
 
 ```
-./test_mizuroute_lakes.sh [work_dir]
+./test_mizuroute_lakes.sh [work_dir] [method]
 ```
 
 `mizuroute_lake_test.py` changes a copy of the bundled domain so that two GRUs
@@ -77,6 +77,12 @@ make FC=gnu FC_EXE=mpif90 F_MASTER=<copy>/route/ NCDF_PATH=<conda env> MODE=fast
 
 The comparison tolerance is 1e-5 of each reach's largest value, as the standalone
 history file is single precision.
+
+## IRF online/offline checks
+
+Run `bash utils/test/test_mizuroute/test_mizuroute_irf.sh [work_dir]` from the repository root after building SUMMA with `USE_MIZUROUTE=ON` and standalone `bin/route_runoff` from the same pinned mizuRoute revision (see `make_mizuRoute.sh` and the build notes above). Python needs NumPy and netCDF4. The check requires both executables and uses only bundled Provo data, writing generated files under `toy_prob/irf/` by default.
+
+The synthetic river chain is compared online/offline with IRF at a 3600 s routing time step. Discharge must match exactly after conversion to single precision. The Doll/HYPE lake case then runs with IRF, using the existing physical checks and discharge/storage tolerance. Run the lake case alone with `bash utils/test/test_mizuroute/test_mizuroute_lakes.sh <work_dir> 1`; the default method remains 3.
 
 ## Comparing against t-route: `compare_to_troute.py`
 

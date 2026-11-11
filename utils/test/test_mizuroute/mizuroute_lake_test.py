@@ -259,10 +259,12 @@ def standalone_input(output, work_dir):
 
 def compare(output, standalone):
     out = read_output(output)
+    with Dataset(output) as c:
+        prefix = {1: "IRF", 3: "KW"}[int(c["method"][0])]
     with Dataset(standalone) as s:
         reach = list(np.array(s["reachID"][:]))
-        q = np.array(s["KWroutedRunoff"][:], dtype="f8")
-        v = np.array(s["KWvolume"][:], dtype="f8")
+        q = np.array(s[f"{prefix}routedRunoff"][:], dtype="f8")
+        v = np.array(s[f"{prefix}volume"][:], dtype="f8")
     order = [reach.index(r) for r in out["seg"]]
     q, v = q[:, order], v[:, order]
     if q.shape != out["Q"].shape:

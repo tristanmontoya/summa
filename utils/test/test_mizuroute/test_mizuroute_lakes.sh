@@ -15,7 +15,7 @@ set -euo pipefail
 #
 # Requires a build configured with -DUSE_MIZUROUTE=ON, and python3 with netCDF4.
 #
-# Usage: ./test_mizuroute_lakes.sh [work_dir]
+# Usage: ./test_mizuroute_lakes.sh [work_dir] [method]
 # ==============================================================================
 
 # ------------------------------------------------------------------ settings --
@@ -32,6 +32,12 @@ FORCING="$DOMAIN/forcing/SUMMA_input/ngen_forcings_summa_format.nc"
 TOOL="$TEST_DIR/mizuroute_lake_test.py"
 
 WORK_DIR="${1:-$TEST_DIR/lake_test}"
+METHOD="${2:-3}"
+case "$METHOD" in
+  1) ROUTE_PREFIX=IRF ;;
+  3) ROUTE_PREFIX=KW ;;
+  *) echo "ERROR: lake test supports methods 1 and 3"; exit 1 ;;
+esac
 SUFFIX="lakes"
 SIM_END="2017-11-30 23:00"
 
@@ -59,7 +65,7 @@ use_mizuroute = true
 namelist_path = "$WORK_DIR/mizu/"
 namelist_file = "param.nml.default"
 
-methods = "3"
+methods = "$METHOD"
 
 dt = 3600
 
@@ -153,7 +159,7 @@ sed -e '/^</ s/$/ !/' > "$WORK_DIR/standalone/lakes.control" <<EOF
 <case_name>               lakes
 <sim_start>               ${SIM_START_OUT/T/ }
 <sim_end>                 ${SIM_END_OUT/T/ }
-<route_opt>               3
+<route_opt>               $METHOD
 <doesBasinRoute>          0
 <dt_qsim>                 3600
 <is_lake_sim>             T
@@ -201,8 +207,8 @@ sed -e '/^</ s/$/ !/' > "$WORK_DIR/standalone/lakes.control" <<EOF
 <instRunoff>              F
 <dlayRunoff>              F
 <sumUpstreamRunoff>       F
-<KWroutedRunoff>          T
-<KWvolume>                T
+<${ROUTE_PREFIX}routedRunoff> T
+<${ROUTE_PREFIX}volume>    T
 EOF
 
 "$ROUTE_EXE" "$WORK_DIR/standalone/lakes.control" > "$WORK_DIR/standalone/run.log" 2>&1 || {

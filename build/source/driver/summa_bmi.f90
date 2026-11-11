@@ -234,6 +234,8 @@ module summabmi
   ! Buffers behind summa_get_ptr_int/float.  The BMI contract is that the returned pointer
   ! stays valid after the call, so these cannot be the callers' own automatic arrays.
   real,    target, allocatable :: ptr_buffer(:)
+  ! Runoff coupling retains the native precision rather than rounding through real.
+  real(rkind), target, allocatable :: runoff_ptr_buffer(:)
   integer, target              :: iptr_buffer
   ! ---------------------------------------------------------------------------------------
   contains
@@ -505,6 +507,7 @@ module summabmi
 
      ! halt=.false. so this returns. A BMI finalize must hand control back to the host 
      call stop_program(0, 'finished simulation successfully.', halt=.false.)
+     if (allocated(runoff_ptr_buffer)) deallocate(runoff_ptr_buffer)
      ! to prevent exiting before HDF5 has closed
      call sleep(2)
      bmi_status = BMI_SUCCESS
@@ -925,7 +928,9 @@ module summabmi
      character (len=*), intent(out) :: type
      integer :: bmi_status
 
-     if(name(1:5)=='model')then ! not currently used, left in for future integer type needs
+     if(name=='land_surface_water__runoff_volume_flux')then
+       type = "double precision"
+     else if(name(1:5)=='model')then ! not currently used, left in for future integer type needs
        type = "integer"
      else
        type = "real"
@@ -986,6 +991,11 @@ module summabmi
      integer ,target :: itarget_arr
      integer :: bmi_status
 
+     if(name=='land_surface_water__runoff_volume_flux')then
+       size = storage_size(0._rkind)/8
+       bmi_status = BMI_SUCCESS
+       return
+     endif
      call get_basin_field(this, name, target_arr, itarget_arr) ! See near bottom of file
      ! use the real or integer target
      if(name(1:5)=='model')then ! not currently used, left in for future integer type needs
@@ -1071,9 +1081,20 @@ module summabmi
      class (summa_bmi), intent(in) :: this
      character (len=*), intent(in) :: name
      double precision, intent(inout) :: dest(:)
-     integer :: bmi_status
+     integer :: bmi_status, iGRU, jHRU, i
 
      select case(name)
+     case('land_surface_water__runoff_volume_flux')
+       ! Keep the established HRU-grid layout, repeating each GRU runoff across
+       ! its HRUs. Read the native basin value directly, without a real buffer.
+       i = 0
+       do iGRU = 1, this%model%summa1_struc(n)%nGRU_local
+         do jHRU = 1, gru_struc(iGRU)%hruCount
+           i = i + 1
+           dest(i) = this%model%summa1_struc(n)%bvarStruct%gru(iGRU)%var(iLookBVAR%averageRoutedRunoff)%dat(1)
+         end do
+       end do
+       bmi_status = BMI_SUCCESS
      case default
        dest(:) = -1.d0
        bmi_status = BMI_FAILURE
@@ -1129,6 +1150,14 @@ module summabmi
      type (c_ptr) :: src
 
      select case(name)
+     case('land_surface_water__runoff_volume_flux')
+       n_elements = sum(gru_struc(:)%hruCount)
+       if(allocated(runoff_ptr_buffer))then
+         if(size(runoff_ptr_buffer)/=n_elements) deallocate(runoff_ptr_buffer)
+       endif
+       if(.not. allocated(runoff_ptr_buffer)) allocate(runoff_ptr_buffer(n_elements))
+       bmi_status = this%get_value_double(name, runoff_ptr_buffer)
+       dest_ptr => runoff_ptr_buffer
      case default
        bmi_status = BMI_FAILURE
      end select
@@ -1192,11 +1221,13 @@ module summabmi
      character (len=*), intent(in) :: name
      double precision, intent(inout) :: dest(:)
      integer, intent(in) :: inds(:)
-     integer :: bmi_status, i, n_elements
-     type (c_ptr) src
-     double precision, pointer :: src_flattened(:)
+     integer :: bmi_status
+     real(rkind) :: values(sum(gru_struc(:)%hruCount))
 
      select case(name)
+     case('land_surface_water__runoff_volume_flux')
+       bmi_status = this%get_value_double(name, values)
+       dest = values(inds)
      case default
        bmi_status = BMI_FAILURE
      end select
